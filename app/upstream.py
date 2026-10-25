@@ -238,6 +238,34 @@ def headers_for(account: dict[str, Any]) -> dict[str, str]:
 
     h.update(BROWSER_HEADERS)
 
+    # ---- 每号一套稳定的设备指纹（覆盖上面的全局默认值）----
+    #
+    # 为什么要盖：所有账号共用出口 IP 已经是关联信号，如果连 UA 和
+    # Client Hints 都完全一样，上游看到的特征就是"同一个 IP 上有一模一样
+    # 的 N 个浏览器"。给每个号派生自己的指纹，是成本最低的隔离手段。
+    #
+    # ⚠️ 必须**整套覆盖**，不能只改 UA：
+    #      UA 说 Chrome/130 而 sec-ch-ua 说 138 是自相矛盾，
+    #      比不做隔离更可疑 —— 那等于自证伪造。
+    #      fingerprint.py 保证版本/平台/语言同源派生，天然自洽。
+    #
+    # 老数据 / cookie 账号可能没有 device_id，此时 fingerprint 会用
+    # sub 或 name 做种子，仍然稳定；实在没有就回落到上面的配置值。
+    try:
+        from . import fingerprint as _fp
+
+        fp = _fp.fingerprint(account)
+        if H_UA and fp.get("user-agent"):
+            h[H_UA] = fp["user-agent"]
+        # Client Hints 只在配置里有这些头时才盖（配置没发就别自己加）
+        for k in ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                  "accept-language", "language-code"):
+            if k in BROWSER_HEADERS and fp.get(k):
+                h[k] = fp[k]
+    except Exception:
+        # 指纹是增强，不是必需。派生失败就用配置的默认值，别让请求挂掉。
+        pass
+
     if APP_AUTHORIZATION and H_APP_AUTH:
         # 网页端会带这个应用级令牌。实测不带也能提交，但带上更贴近真实客户端。
         h[H_APP_AUTH] = APP_AUTHORIZATION

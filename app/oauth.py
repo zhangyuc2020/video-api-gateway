@@ -40,6 +40,28 @@ UA = (
 )
 
 
+def _ua_for(device_id: str = "") -> str:
+    """这个账号该用的 User-Agent。
+
+    为什么 OAuth 流程也要跟着账号走（2026-10-25 加）：
+      upstream.headers_for() 现在用**每号一套**指纹（见 fingerprint.py），
+      而 OAuth 的注册 / 兑换 / 刷新 / 撤销原本统一用全局 UA。
+      结果同一个账号在"刷新 token"和"调 API"时表现为两个不同浏览器 ——
+      这比不做隔离更可疑，等于自证在用两套客户端。
+
+    所以这里按 device_id 取同一个指纹里的 UA。
+    没有 device_id 时（注册 client 那种还没有账号的场景）回落到全局 UA。
+    """
+    if not device_id:
+        return UA
+    try:
+        from . import fingerprint as _fp
+
+        return _fp.fingerprint({"device_id": device_id})["user-agent"]
+    except Exception:
+        return UA
+
+
 class AuthError(RuntimeError):
     def __init__(self, error: str, detail: Any = None):
         self.error = error
@@ -241,7 +263,8 @@ async def exchange_code(
     return data
 
 
-async def _raw_refresh(refresh_token: str, client_id: str = "") -> dict[str, Any]:
+async def _raw_refresh(refresh_token: str, client_id: str = "",
+                       device_id: str = "") -> dict[str, Any]:
     """**内部函数，不要直接调用。**
 
     只换 token 不落库。OAuth 的 refresh_token 是**单次使用**的：
@@ -291,7 +314,8 @@ async def _raw_refresh(refresh_token: str, client_id: str = "") -> dict[str, Any
         "client_id": client_id,
     }
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(TOKEN, data=form, headers={"user-agent": UA})
+        r = await c.post(TOKEN, data=form,
+                         headers={"user-agent": _ua_for(device_id)})
 
     if r.status_code == 429:
         # 按服务端 retry-after 熔断整个通道，**绝不重试**
@@ -358,6 +382,8 @@ async def refresh_and_persist(account: dict[str, Any]) -> dict[str, Any]:
          否则抛错 —— 宁可这次刷新失败，也不让 token 在黑盒里丢失。
     """
     aid = account["id"]
+    # 用账号自己的设备标识派生 UA，保证刷新和业务请求是同一个浏览器
+    dev_id = str(account.get("device_id") or "")
     rt = account.get("refresh_token") or ""
     if not rt:
         raise AuthError("no_refresh_token", f"{account.get('name','?')} 无 refresh_token")
@@ -370,7 +396,7 @@ async def refresh_and_persist(account: dict[str, Any]) -> dict[str, Any]:
     use_cid = claimed_cid or stored_cid
 
     try:
-        bundle = await _raw_refresh(rt, use_cid)
+        bundle = await _raw_refresh(rt, use_cid, dev_id)
     except AuthError as e:
         # 第一次失败 + 我们还有另一个候选 client → 换一个重试一次。
         # 只在**明确是 client 不匹配**时重试，别把真正的 token 失效也重试成风暴。
@@ -379,7 +405,7 @@ async def refresh_and_persist(account: dict[str, Any]) -> dict[str, Any]:
             and e.detail.get("error") in ("invalid_client", "invalid_grant")
         if not (other and other != use_cid and retriable):
             raise
-        bundle = await _raw_refresh(rt, other)
+        bundle = await _raw_refresh(rt, other, dev_id)
         use_cid = other
 
     new_at = bundle["access_token"]
@@ -420,7 +446,8 @@ async def refresh_and_persist(account: dict[str, Any]) -> dict[str, Any]:
 
 
 async def revoke(
-    token: str, kind: str = "refresh_token", client_id: str = ""
+    token: str, kind: str = "refresh_token", client_id: str = "",
+    device_id: str = ""
 ) -> bool:
     """作废 token。返回是否**确认**作废成功。
 
@@ -437,7 +464,8 @@ async def revoke(
     form = {"token": token, "client_id": client_id, "token_type_hint": kind}
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.post(REVOKE, data=form, headers={"user-agent": UA})
+            r = await c.post(REVOKE, data=form,
+                             headers={"user-agent": _ua_for(device_id)})
         return r.status_code in (200, 204)
     except Exception:
         return False
@@ -496,7 +524,7 @@ async def fetch_identity(
         "deviceid": device_id,
         "market": "website",
         "platform": "website",
-        "user-agent": UA,
+        "user-agent": _ua_for(device_id),
         "referer": "https://picsart.com/",
     }
 
@@ -601,7 +629,7 @@ async def login_from_cookie(cookie: str) -> dict[str, Any]:
         "deviceid": device_id,
         "market": "website",
         "platform": "website",
-        "user-agent": UA,
+        "user-agent": _ua_for(device_id),
         "referer": "https://picsart.com/",
         "origin": "https://picsart.com",
     }
