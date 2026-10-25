@@ -417,7 +417,8 @@ async def version_info():
             "latest": "",
             "has_update": False,
             "url": f"https://github.com/{V.REPO}/releases",
-            "repo": V.REPO,
+            "page": f"https://github.com/{V.REPO}/releases",
+            "source": V.SOURCE,
             "checked_at": 0,
             "error": type(e).__name__,
         }
