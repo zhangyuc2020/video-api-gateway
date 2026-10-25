@@ -43,6 +43,7 @@ _OPEN_PREFIX = (
     "/__domain",          # 发布后自检：确认应用看到的是哪个公网域名
     "/__diag",            # 发布后自检：确认配置真的进了上游模块（只报有无）
     "/__probe",           # 网络自检：从本部署测上游可达性（目标写死，不是 SSRF）
+    "/__version",         # 版本检查：首屏要显示更新提示，不能要求登录
     "/static/",           # CSS/JS：激活页也要有样式
     "/apple-touch-icon",  # 浏览器自动请求，拦截会在控制台刷红
     "/favicon",
@@ -392,6 +393,34 @@ async def probe():
         "proxy_matters": proxy_matters,
         "note": "每个目标测两次：direct=强制直连，env=沿用环境变量/显式代理",
     }
+
+
+@router.get("/__version")
+async def version_info():
+    """版本 + 是否有新版本。
+
+    放在 guard 里而不是 api_admin，因为它必须**不需要登录**就能访问 ——
+    更新提示条要在首屏显示，那时用户可能还没激活/没登录。
+
+    安全上无风险：只回版本号和公开的 Release 地址。
+    """
+    from workbuddy import version as V
+
+    try:
+        return await V.check_async()
+    except Exception as e:
+        # check_async 本身不抛，这是最后一道保险：任何意外都不能让
+        # 版本检查变成 500（前端会以为整个应用坏了）。
+        log.warning("version check 异常：%s", e)
+        return {
+            "current": V.current(),
+            "latest": "",
+            "has_update": False,
+            "url": f"https://github.com/{V.REPO}/releases",
+            "repo": V.REPO,
+            "checked_at": 0,
+            "error": type(e).__name__,
+        }
 
 
 @router.get("/__diag")

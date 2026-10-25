@@ -527,6 +527,12 @@ async def _run_task(tid: str, params: dict[str, Any]) -> None:
             t = store.get_task(tid)
             if not t or t["status"] not in ("queued", "in_progress"):
                 pass
+            elif t["status"] == "cancelled":
+                # 用户主动取消（2026-10-25 加）。
+                # cancel_task 已经把状态写成 cancelled 了，这里**不许覆盖**
+                # 成 failed —— "我点了取消"和"任务失败了"是两回事，
+                # 混在一起会让统计和客户认知都出错。
+                pass
             elif (t.get("upstream_id") or "").strip():
                 # 提交过 → 交给启动续跟，这里不动它
                 store.update_task(

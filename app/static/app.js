@@ -84,6 +84,8 @@ function showApp() {
   // 账号/任务数据照旧全量拉一次（账号页的统计要用），但**落在哪个 tab**
   // 由 restoreTab 决定，不再固定回第一个。
   restoreTab();
+  // 版本检查放最后：它要外呼 GitHub，不能拖慢首屏
+  setTimeout(checkUpdate, 1200);
 }
 
 // 首屏判断顺序：激活 -> 主界面（不再要求登录）。
@@ -419,6 +421,9 @@ async function loadTasks() {
       in_progress: ['生成中', 'ok'],
       completed: ['完成', 'ok'],
       failed: ['失败', 'dead'],
+      // 用户主动取消。**不是 failed** —— 「我点了取消」和「任务失败了」
+      // 是两回事，混成同一个颜色会让人以为出了故障。
+      cancelled: ['已取消', 'dim'],
       unknown: ['状态未知', 'cooling'],
     };
     const [txt, cls] = LABEL[t.status] || [t.status, 'cooling'];
@@ -480,18 +485,31 @@ async function loadTasks() {
           ? `<span class="dim err-line" title="${esc(t.error)}">${esc(t.error.slice(0, 30))}</span>`
           : '—');
 
-    // 重试按钮只在**可能成功**的失败任务上出现。
+    // 重试 / 取消按钮。两个都只在**后端会答应**的情况下出现，
+    // 免得用户点到一个必然报错的按钮。
     //
-    // 判据对齐后端 /api/tasks/{tid}/retry 的拒绝条件：
-    //   · 有 upstream_id  -> 上游可能还在跑/已出片，重提会重复出片
+    // 重试（/retry 的拒绝条件）：
+    //   · 有 upstream_id -> 上游可能还在跑/已出片，重提会重复出片
     //   · queued/in_progress -> 正在处理
     //   · completed -> 已完成
-    // 后端也会拦，这里只是别让用户点到一个必然报错的按钮。
+    //
+    // 取消（/cancel 的拒绝条件，2026-10-25 加）：
+    //   · 有 upstream_id -> 上游没取消接口，本地取消只会让账号被
+    //     一个看不见的任务锁住（每号并发=1）。后端会 409 说明原因。
     const canRetry = t.status === 'failed' && !t.upstream_id;
-    const act = canRetry
-      ? `<button class="ghost mini" data-retry="${esc(t.id)}"
-                 title="用原参数重新跑一次（不用重填）">重试</button>`
-      : '<span class="dim">—</span>';
+    const canCancel = (t.status === 'queued' || t.status === 'in_progress')
+                      && !t.upstream_id;
+
+    const btns = [];
+    if (canCancel) {
+      btns.push(`<button class="ghost mini" data-cancel="${esc(t.id)}"
+                 title="取消这个还在排队的任务（还没提交到上游）">取消</button>`);
+    }
+    if (canRetry) {
+      btns.push(`<button class="ghost mini" data-retry="${esc(t.id)}"
+                 title="用原参数重新跑一次（不用重填）">重试</button>`);
+    }
+    const act = btns.length ? btns.join(' ') : '<span class="dim">—</span>';
 
     // 同理：任务 id 不拼进 onclick，走 data-* + 事件委托（见下面的监听器）。
     return `<tr class="task-row" data-tid="${esc(t.id)}">
@@ -508,6 +526,27 @@ async function loadTasks() {
 }
 
 // 任务重试：用 tasks.params 里的原始快照重跑，用户不用重填。
+// 取消一个还没提交到上游的任务。
+//
+// 后端只允许这一种（/api/tasks/{tid}/cancel）：上游没有取消接口，
+// 已提交的任务本地取消只会让该账号被一个"看不见的任务"占着 ——
+// 每号并发=1，那样队列会卡住。所以后端会 409 并说清原因，
+// 这里把原因原样显示给用户。
+async function cancelTask(tid) {
+  if (!confirm('取消这个任务？\n\n它还在排队，尚未提交到上游，取消不会有任何副作用。')) {
+    return;
+  }
+  try {
+    await api(`/api/tasks/${encodeURIComponent(tid)}/cancel`, { method: 'POST' });
+    toast('已取消', 'ok');
+    loadTasks();
+    loadStats();
+  } catch (e) {
+    // 409 的文案本来就是给用户看的（说明为什么不能取消），原样显示
+    toast(e.message, 'err', 8000);
+  }
+}
+
 async function retryTask(tid) {
   try {
     const r = await api(`/api/tasks/${encodeURIComponent(tid)}/retry`,
@@ -523,11 +562,17 @@ async function retryTask(tid) {
 
 // 任务行点击（事件委托，替代原来的 onclick="openTask('id')"）
 $('#task-table').addEventListener('click', (ev) => {
-  // 重试按钮优先于"打开详情"：否则点重试会同时弹出任务详情
+  // 按钮优先于"打开详情"：否则点按钮会同时弹出任务详情
   const rb = ev.target.closest('button[data-retry]');
   if (rb) {
     ev.stopPropagation();
     retryTask(rb.dataset.retry);
+    return;
+  }
+  const cb = ev.target.closest('button[data-cancel]');
+  if (cb) {
+    ev.stopPropagation();
+    cancelTask(cb.dataset.cancel);
     return;
   }
   // 行内的链接（打开成片）要照常跳转，不要被这里吞掉
@@ -1401,3 +1446,99 @@ window.addEventListener('message', (ev) => {
 })();
 
 boot();
+
+// ---------------------------------------------------------------- 版本更新提示
+
+// 注意：这是**纯提示**，不做自动更新。
+//
+// 代码在客户自己的项目目录里，自动替换等于我们获得远程执行任意代码的能力 ——
+// 一旦私钥泄露所有客户机器失守。收益远小于风险，所以只提示、由客户自己
+// 重新发布。
+//
+// 失败必须静默：GitHub 在部分网络下不可达，查不到就整条隐藏，
+// 绝不因为版本检查失败而影响任何功能。
+const UPDATE_HIDE_KEY = 'pool.update.hidden';
+
+async function checkUpdate() {
+  let d;
+  try {
+    const r = await fetch('/__version', { cache: 'no-store' });
+    if (!r.ok) return;
+    d = await r.json();
+  } catch {
+    return;                       // 静默：查不到就当没有更新
+  }
+  if (!d || !d.has_update) return;
+
+  // 用户点过「本次不再提示」且版本没变 -> 不再打扰
+  let hidden = '';
+  try { hidden = localStorage.getItem(UPDATE_HIDE_KEY) || ''; } catch { /* 隐私模式 */ }
+  if (hidden === d.latest) return;
+
+  const bar = document.getElementById('update-bar');
+  if (!bar) return;
+  const setTxt = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = v;
+  };
+  setTxt('update-ver', d.latest);
+  setTxt('update-cur', d.current);
+  const link = document.getElementById('update-link');
+  if (link && d.url) link.href = d.url;
+  bar.dataset.latest = d.latest;
+  bar.classList.remove('hidden');
+}
+
+function hideUpdate() {
+  const bar = document.getElementById('update-bar');
+  if (!bar) return;
+  try { localStorage.setItem(UPDATE_HIDE_KEY, bar.dataset.latest || '1'); } catch { /* 忽略 */ }
+  bar.classList.add('hidden');
+}
+
+// 复制一段能直接粘给 AI 的更新提示词。
+//
+// 为什么是提示词而不是下载链接：客户各自部署，更新要重新发布。
+// 光给 zip 他还得自己替换文件再发布，而这一步他能让 WorkBuddy 的 AI 做 ——
+// 所以直接把提示词准备好，复制即用。
+async function copyUpdatePrompt() {
+  const bar = document.getElementById('update-bar');
+  const latest = (bar && bar.dataset.latest) || '';
+  const cur = document.getElementById('update-cur')?.textContent || '';
+  const url = document.getElementById('update-link')?.href || '';
+
+  const prompt = [
+    '请帮我把这个项目更新到最新版本并重新发布。',
+    '',
+    '## 当前情况',
+    `- 当前版本：${cur}`,
+    `- 目标版本：${latest}`,
+    `- 发布页：${url}`,
+    '',
+    '## 请你做的事',
+    '1. 从上面的发布页下载新版 zip 并解压',
+    '2. 把解压出来的新代码，覆盖到我原来的项目目录',
+    '   **重要：保留我原来的 data/ 目录** —— 里面是账号和激活凭证，删了要重新激活',
+    '3. 重新发布，参数照旧：',
+    '   language: python',
+    '   startCmd: python workbuddy/entry.py',
+    '   port: 3000',
+    '   installCmd: pip install -r requirements.txt',
+    '',
+    '## 铁律',
+    '启动命令不要改成 uvicorn app.main:app —— 会跳过配置注入，',
+    '应用能打开但所有功能都是坏的。',
+    '',
+    '## 发布后请验证',
+    'curl -s "https://我的域名/api/me"',
+    '期望包含 logged_in 和 need_login 两个字段。',
+  ].join('\n');
+
+  try {
+    await navigator.clipboard.writeText(prompt);
+    toast('更新提示词已复制，粘给你的 AI 即可', 'ok', 6000);
+  } catch {
+    // 剪贴板被拒（非 https / 权限）：退回到弹窗让用户手抄
+    window.prompt('复制下面这段给你的 AI：', prompt);
+  }
+}

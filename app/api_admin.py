@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html as _html
 import json
+import logging
 import secrets
 import time
 import urllib.parse
@@ -14,6 +15,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from . import oauth, pool, store, upstream
+
+log = logging.getLogger("picsart-pool")
 from .config import REVOKE_LOGOUT, settings
 from .security import (
     COOKIE_NAME,
@@ -1134,6 +1137,63 @@ async def task_detail(tid: str, _: dict = Depends(require_admin)):
     return d
 
 
+@router.post("/api/tasks/{tid}/cancel")
+async def cancel_task(tid: str, _: dict = Depends(require_admin)):
+    """取消一个**尚未提交到上游**的任务。
+
+    为什么只允许这一种（2026-10-25 定）：
+
+      · upstream_id 为空 -> 上游根本不知道有这个任务，取消是干净的：
+        本地 asyncio.Task.cancel()，队列位置释放，不占任何资源。
+
+      · upstream_id 非空 -> **不能取消**。上游没有公开的取消接口，
+        我们能做的只有"本地不理它"，但那个任务会继续在 Picsart 那边
+        跑着、继续占着该账号的并发名额（每号并发=1）。
+        于是账号被一个"本地看不见的任务"锁住，队列后面的任务干等 ——
+        这正是 pool.py 顶部注释里记的那个坑。
+        所以宁可明确拒绝并说清原因，也不做"假取消"。
+
+    取消后的状态是 `cancelled`，**不是** `failed`。
+    「我点了取消」和「任务失败了」是两回事，混在一起统计会失真。
+    """
+    from . import api_proxy
+
+    t = store.get_task(tid)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+
+    up_id = (t.get("upstream_id") or "").strip()
+    if up_id:
+        raise HTTPException(
+            409,
+            f"任务已提交到上游（{up_id}），无法取消。"
+            f"上游会继续执行，该账号的名额在它结束前不会释放。"
+            f"你可以在这里等它完成，结果会自动回来。",
+        )
+
+    if t["status"] not in ("queued", "in_progress"):
+        raise HTTPException(409, f"任务当前状态是 {t['status']}，不需要取消")
+
+    # 先落库再 cancel：cancel() 会让 _run_task 的 finally 立刻执行，
+    # 那时它会读库判断状态。顺序反了就会看到「cancelled 被覆盖成 failed」。
+    store.update_task(
+        tid,
+        status="cancelled",
+        error="已由用户取消",
+        finished_at=time.time(),
+        queue_pos=0,
+    )
+
+    job = api_proxy._TASKS.get(tid)
+    if job is not None and not job.done():
+        # 不 await —— cancel() 只发出请求，真正收尾在事件循环里。
+        # await 的话，若 _run_task 卡在不可中断的 await 上会拖住这个 HTTP 请求。
+        job.cancel()
+
+    log.info("task %s 已被用户取消（未提交到上游）", tid)
+    return {"ok": True, "id": tid, "status": "cancelled"}
+
+
 @router.post("/api/tasks/{tid}/retry")
 async def retry_task(tid: str, _: dict = Depends(require_admin)):
     """把一条失败任务重新跑一遍，**参数不用重填**（一直在 tasks.params 里）。
@@ -1238,7 +1298,10 @@ async def api_docs(download: int = 0, _: dict = Depends(require_admin)):
 @router.get("/api/health")
 async def health(_: dict = Depends(require_admin)):
     s = settings
+    from workbuddy.version import current as _ver
+
     return {
+        "version": _ver(),
         "default_resolution": s.default_resolution,
         "default_ratio": s.default_ratio,
         "default_duration": s.default_duration,

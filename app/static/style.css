@@ -506,3 +506,31 @@ button.ghost.attention:hover{background:rgba(255,92,92,.12)}
 /* 窄屏时 header 里的联系方式会挤压 tab，直接收起 —— 登录页和激活页
    仍然有，不至于找不到人。 */
 @media (max-width:760px){ .contact-hd{display:none} }
+
+/* ---------- 版本更新提示条 ----------
+   只在检测到新版本时出现（前端 checkUpdate 控制 .hidden）。
+   黄色是刻意的：它是"该做点什么"的提示，但不像红色那样像故障。
+   放在 header 下方整条铺满，进主界面第一眼就看到。 */
+.update-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:10px 22px;font-size:13px;line-height:1.5;
+  background:linear-gradient(90deg,#3a2e12 0%,#2a2110 100%);
+  border-bottom:1px solid #5a4418;color:#f0d99a}
+.update-icon{display:inline-flex;align-items:center;justify-content:center;
+  width:20px;height:20px;border-radius:50%;background:#f0b429;color:#241a02;
+  font-weight:700;font-size:12px;flex:0 0 auto}
+.update-text{color:#e8d3a0}
+.update-text b{color:#ffd76e;font-weight:600;user-select:all}
+.update-btn{background:#f0b429;color:#241a02;border:0;border-radius:7px;
+  padding:5px 12px;font-size:12.5px;font-weight:600;cursor:pointer;
+  transition:background .15s}
+.update-btn:hover{background:#ffc844}
+.update-link{color:#d9c08a;font-size:12.5px;text-decoration:none;
+  border-bottom:1px dotted #9c8560}
+.update-link:hover{color:#ffd76e}
+.update-x{margin-left:auto;background:transparent;border:0;color:#9c8560;
+  font-size:15px;cursor:pointer;padding:2px 6px;line-height:1}
+.update-x:hover{color:#ffd76e}
+@media (max-width:700px){
+  .update-bar{padding:9px 14px;font-size:12.5px;gap:8px}
+  .update-text{flex:1 1 100%}
+}

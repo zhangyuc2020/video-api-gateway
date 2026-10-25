@@ -90,6 +90,27 @@
     <button class="ghost" onclick="doLogout()">退出</button>
   </header>
 
+  <!-- 版本更新提示条。
+       为什么放在 header 之后、main 之前：进主界面第一眼就能看到，
+       但又不打断导航。
+
+       为什么是"点击复制更新提示词"而不是直接给下载链接：
+       客户各自部署，代码在他自己机器的目录里。光给个 zip 链接他还得
+       自己替换文件、重新发布 —— 而这一步他能让 WorkBuddy 的 AI 做，
+       所以这里直接给一段能粘给 AI 的提示词。
+
+       只有检测到**新版本**才显示；查不到（GitHub 被墙/超时）时整条隐藏，
+       不打扰。 -->
+  <div id="update-bar" class="update-bar hidden">
+    <span class="update-icon">↑</span>
+    <span class="update-text">
+      有新版本 <b id="update-ver">—</b>（当前 <span id="update-cur">—</span>）
+    </span>
+    <button class="update-btn" onclick="copyUpdatePrompt()">复制更新部署提示词</button>
+    <a id="update-link" class="update-link" target="_blank" rel="noopener">查看发布页</a>
+    <button class="update-x" onclick="hideUpdate()" title="本次不再提示">✕</button>
+  </div>
+
   <main>
     <section id="tab-accounts" class="tab-panel active">
       <div class="stat-row" id="stats"></div>
