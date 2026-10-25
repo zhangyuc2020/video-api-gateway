@@ -115,13 +115,32 @@ async def oauth_start(name: str = "", manual: bool = False,
       回调页只把 code 显示出来，由用户复制回表单。
     这样每次都是全新授权流程，不会被浏览器已有的 Picsart 会话静默复用。
     """
-    url, verifier = await oauth.build_authorize_url(manual=manual)
+    # 每个账号一个独立 client（2026-10-25 加）。
+    #
+    # slot 拼进 redirect_uri 的 query，让 DCR 注册出独立 client_id。
+    # 这样上游授权服务器看到的是「不同 client 各有一个用户」，
+    # 而不是「一个 client 下有 N 个用户」—— 后者是明确的关联信号。
+    #
+    # slot 的取值：
+    #   · 重新登录（relogin>0）-> 沿用原账号的 slot，保持 client 不变
+    #     （refresh_token 绑定 client，换了就刷新失败）
+    #   · 新增 -> 随机生成，写进 _PENDING，账号落库时一并保存
+    slot = ""
+    if relogin:
+        _row = store.get_account(int(relogin))
+        if _row:
+            slot = str(_row.get("client_slot") or "")
+    if not slot:
+        slot = secrets.token_hex(8)
+
+    url, verifier = await oauth.build_authorize_url(manual=manual, slot=slot)
     state = secrets.token_urlsafe(16)
     with _PENDING_LOCK:
         _PENDING[state] = {
             "verifier": verifier,
             "name": name.strip(),
             "manual": manual,
+            "slot": slot,
             "created": time.time(),
         }
         for k in [k for k, v in _PENDING.items() if time.time() - v["created"] > 900]:
@@ -184,12 +203,16 @@ async def oauth_exchange(body: ExchangeBody, _: dict = Depends(require_admin)):
             _PENDING.pop(used_state, None)
 
     try:
-        bundle = await oauth.exchange_code(code, pending["verifier"], manual=True)
+        bundle = await oauth.exchange_code(
+            code, pending["verifier"], manual=True,
+            slot=str(pending.get("slot") or ""),
+        )
     except oauth.AuthError as e:
         raise HTTPException(400, f"换取 token 失败：{e}")
 
     return await _store_oauth_account(
-        bundle, pending.get("name", ""), pending.get("relogin", 0) or 0
+        bundle, pending.get("name", ""), pending.get("relogin", 0) or 0,
+        slot=str(pending.get("slot") or ""),
     )
 
 
@@ -246,8 +269,20 @@ async def oauth_begin(name: str = "", relogin: int = 0,
     授权成功后按 Picsart 的 sub 匹配到原记录并覆盖令牌，
     不会新增重复账号（_find_by_sub 已经做了这个匹配）。
     """
+    # 每个账号一个独立 client（2026-10-25 加）。详见 oauth.ensure_client。
+    #
+    # ⚠️ 重新登录必须**沿用原 client_slot**：refresh_token 绑定签发它的
+    # client_id，换了 slot 就等于换了 client，刷新时必然 invalid_grant。
+    slot = ""
+    if relogin:
+        _row = store.get_account(int(relogin))
+        if _row:
+            slot = str(_row.get("client_slot") or "")
+    if not slot:
+        slot = secrets.token_hex(8)
+
     try:
-        url, verifier = await oauth.build_authorize_url(manual=True)
+        url, verifier = await oauth.build_authorize_url(manual=True, slot=slot)
     except oauth.AuthError as e:
         # 这一页是用户**新开标签页**打开的，出错时如果走全局 500，
         # 他会看到一个纯黑页面 + 一行 JSON（`{"error":""}`），完全无从下手。
@@ -273,6 +308,9 @@ async def oauth_begin(name: str = "", relogin: int = 0,
             "name": name.strip(),
             "manual": True,
             "relogin": int(relogin or 0),
+            # slot 必须跟着 state 走：兑换时要用**同一个 client**，
+            # 否则拿到的 refresh_token 会被绑到一个这里取不到的 client_id 上。
+            "slot": slot,
             "created": time.time(),
         }
         # 顺手清过期的（同一把锁内做，避免和并发兑换打架）
@@ -467,7 +505,10 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         return _callback_page(False, "授权状态已过期，请回到管理页重新发起")
 
     try:
-        bundle = await oauth.exchange_code(code, pending["verifier"])
+        bundle = await oauth.exchange_code(
+            code, pending["verifier"],
+            slot=str(pending.get("slot") or ""),
+        )
     except oauth.AuthError as e:
         return _callback_page(False, f"换取 token 失败：{e}")
 
@@ -512,6 +553,9 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         "access_token": access,
         "refresh_token": bundle.get("refresh_token") or "",
         "client_id": bundle.get("client_id") or "",
+        # 记下这个账号用的 client 槽位。重新登录必须沿用，
+        # 否则 ensure_client 会注册新 client -> refresh_token 失效。
+        "client_slot": slot,
         "device_id": device_id,
         "sub": ident.get("sub", ""),
         "username": ident.get("username", ""),
@@ -728,7 +772,8 @@ def _code_page(code: str, state: str, error: str) -> HTMLResponse:
 
 
 async def _store_oauth_account(
-    bundle: dict[str, Any], want_name: str, relogin_id: int = 0
+    bundle: dict[str, Any], want_name: str, relogin_id: int = 0,
+    slot: str = "",
 ) -> dict[str, Any]:
     """把 OAuth token 落库（手动/自动回调共用）。
 
@@ -794,6 +839,9 @@ async def _store_oauth_account(
         "access_token": access,
         "refresh_token": bundle.get("refresh_token") or "",
         "client_id": bundle.get("client_id") or "",
+        # 记下这个账号用的 client 槽位。重新登录必须沿用，
+        # 否则 ensure_client 会注册新 client -> refresh_token 失效。
+        "client_slot": slot,
         "device_id": device_id,
         "sub": ident.get("sub", ""),
         "username": ident.get("username", ""),

@@ -130,6 +130,9 @@ _MIGRATIONS = [
     ("accounts", "photo", "TEXT NOT NULL DEFAULT ''"),
     # refresh_token 必须用签发它的 client_id 去刷新，所以要记住来源
     ("accounts", "client_id", "TEXT NOT NULL DEFAULT ''"),
+    # 每个账号一个独立 OAuth client 的槽位（拼进 redirect_uri 的 query）。
+    # 重新登录时必须沿用，否则换了 client_id -> refresh_token 失效。
+    ("accounts", "client_slot", "TEXT NOT NULL DEFAULT ''"),
     # 任务进度：上游 progress.percent，方便前端显示"跑到 60% 了"
     ("tasks", "percent", "INTEGER NOT NULL DEFAULT 0"),
     # 提交的完整参数（JSON），任务页要展示"当时到底发了什么"
@@ -250,6 +253,8 @@ _ACCOUNT_FIELDS = (
     # → refresh 拿错 client 打 → invalid_grant → fails 3 → 账号被判 dead。
     # 这个字段曾经在 _MIGRATIONS 里加过列却没进白名单，等于白加。
     "client_id",
+    # 同上：不在白名单里的字段会被 upsert 静默丢弃。
+    "client_slot",
 )
 
 

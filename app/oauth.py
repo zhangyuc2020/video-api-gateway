@@ -146,7 +146,7 @@ async def register_client(redirect_uri: str, name: str = "picsart-pool") -> dict
 MANUAL_REDIRECT_PATH = "/oauth/manual-callback"
 
 
-async def ensure_client(manual: bool = False) -> dict[str, Any]:
+async def ensure_client(manual: bool = False, slot: str = "") -> dict[str, Any]:
     """取/注册 client。
 
     manual=True 时用独立的 redirect_uri（/oauth/manual-callback），
@@ -156,12 +156,32 @@ async def ensure_client(manual: bool = False) -> dict[str, Any]:
     ⚠️ 两种 redirect_uri 各自对应一个 client，分开存。
     绝不能因为"这次想用另一种模式"就覆盖掉另一种的 client_id：
     refresh_token 与签发它的 client_id 绑定，混用会 400 无效授权。
+
+    ---- slot：每个账号一个独立 client（2026-10-25 新增）----
+
+    背景：所有账号共用一个 client_id 时，上游授权服务器能直接看到
+    「client_abc 下有 N 个不同用户（sub）」。这是比 UA / IP 更明确的
+    关联信号 —— UA 可以解释成"同一台机器多开"，client 不能。
+
+    做法：把 slot 拼进 redirect_uri 的 query，让 DCR 注册出独立 client。
+
+    实测（2026-10-25，从服务器直接打 register 端点）：
+      · redirect_uri 带 ?slot=xxx  -> HTTP 201，上游原样保存完整 URI
+      · 连续 2 次注册间隔 4 秒      -> 没触发限流
+    协议层成立。
+
+    slot 为空时回落到共享 client（兼容不传 slot 的调用点）。
     """
-    want = (
-        f"{settings.public_url}{MANUAL_REDIRECT_PATH}"
-        if manual
-        else settings.redirect_uri
-    )
+    if manual:
+        base = f"{settings.public_url}{MANUAL_REDIRECT_PATH}"
+        # slot 只加在 query 上。路径段方案也行（也实测过），但要给每个
+        # slot 加一条 FastAPI 路由，改动大；query 方案直接能读。
+        want = f"{base}?slot={slot}" if slot else base
+    else:
+        want = settings.redirect_uri
+        if slot:
+            want = f"{want}?slot={slot}"
+
     saved = store.get_client(want)
     if saved:
         return saved
@@ -172,7 +192,8 @@ async def ensure_client(manual: bool = False) -> dict[str, Any]:
 
 
 async def build_authorize_url(
-    scope: str = "", *, force_login: bool = True, manual: bool = False
+    scope: str = "", *, force_login: bool = True, manual: bool = False,
+    slot: str = "",
 ) -> tuple[str, str]:
     """返回 (授权 URL, verifier)。verifier 要在兑换 code 时带上。
 
@@ -210,7 +231,7 @@ async def build_authorize_url(
             "授权 scope 为空（站点配置未加载）。"
             "请确认已激活并重启应用，然后重试",
         )
-    client = await ensure_client(manual=manual)
+    client = await ensure_client(manual=manual, slot=slot)
     verifier = new_verifier()
     params = {
         "client_id": client["client_id"],
@@ -230,11 +251,11 @@ async def build_authorize_url(
 # ---------------------------------------------------------------- token
 
 async def exchange_code(
-    code: str, verifier: str, *, manual: bool = False
+    code: str, verifier: str, *, manual: bool = False, slot: str = ""
 ) -> dict[str, Any]:
     """用 code 换 token。返回的 bundle 里补一个 client_id，
     因为 refresh_token 只能拿签发它的同一个 client 去刷新。"""
-    client = await ensure_client(manual=manual)
+    client = await ensure_client(manual=manual, slot=slot)
     form = {
         "grant_type": "authorization_code",
         "code": code,
