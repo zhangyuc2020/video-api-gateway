@@ -6,6 +6,7 @@ import html as _html
 import json
 import logging
 import secrets
+import threading
 import time
 import urllib.parse
 from typing import Any
@@ -29,8 +30,17 @@ from .security import (
 
 router = APIRouter()
 
-# OAuth 临时态（state -> verifier），进程内即可，量小、短命
+# OAuth 临时态（state -> verifier），进程内即可，量小、短命。
+#
+# ⚠️ 必须配锁（2026-10-25 加）。
+#
+# 三个入口会同时碰它：/oauth/begin 写、manual-callback 不写、exchange 读+删。
+# Web 服务器是多线程的（waitress / uvicorn 的线程池），而 dict 的
+# "遍历 + pop" 不是原子操作 —— 两个并发兑换可能拿到**同一个 pending**，
+# 后一个就会用错 verifier 去换 code，PKCE 校验必然失败，
+# 用户看到的是"换取 token 失败"，但完全指不出原因。
 _PENDING: dict[str, dict[str, Any]] = {}
+_PENDING_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------- 登录
@@ -107,14 +117,15 @@ async def oauth_start(name: str = "", manual: bool = False,
     """
     url, verifier = await oauth.build_authorize_url(manual=manual)
     state = secrets.token_urlsafe(16)
-    _PENDING[state] = {
-        "verifier": verifier,
-        "name": name.strip(),
-        "manual": manual,
-        "created": time.time(),
-    }
-    for k in [k for k, v in _PENDING.items() if time.time() - v["created"] > 900]:
-        _PENDING.pop(k, None)
+    with _PENDING_LOCK:
+        _PENDING[state] = {
+            "verifier": verifier,
+            "name": name.strip(),
+            "manual": manual,
+            "created": time.time(),
+        }
+        for k in [k for k, v in _PENDING.items() if time.time() - v["created"] > 900]:
+            _PENDING.pop(k, None)
     return {"url": url.replace("&redirect_uri=", f"&state={state}&redirect_uri="),
             "state": state, "manual": manual}
 
@@ -139,15 +150,38 @@ async def oauth_exchange(body: ExchangeBody, _: dict = Depends(require_admin)):
     if not code:
         raise HTTPException(400, "无法从输入中解析出 code")
 
-    pending = _PENDING.pop(state, None) if state else None
-    if not pending:
-        # 容忍 state 丢失：用最近一次未使用的 manual 会话
-        cand = [(k, v) for k, v in _PENDING.items()
-                if v.get("manual") and time.time() - v["created"] < 900]
-        if not cand:
-            raise HTTPException(400, "授权会话已过期，请重新点击授权")
-        state, pending = cand[-1]
-        _PENDING.pop(state, None)
+    # 取出这次的 pending（verifier 在里面）。
+    #
+    # ⚠️ 整段必须在锁内（2026-10-25 修）：并发兑换时两次 pop 可能命中
+    # 同一条记录，后一个就会拿错 verifier 去换 code，PKCE 必然失败，
+    # 用户看到"换取 token 失败"却看不出原因。
+    with _PENDING_LOCK:
+        pending = _PENDING.pop(state, None) if state else None
+        used_state = state
+        if not pending:
+            # 容忍 state 丢失：前端本来就不传 state（见 startAuth 里
+            # `oauthState = ''`），所以几乎每次都走这条。
+            #
+            # 但"取最后一个"有风险：如果同时开了两个授权流程，
+            # 后兑换的那个会拿到前一个的 verifier -> PKCE 失败。
+            # 所以只在**只有一个候选**时才兜底；多于一个就要求用户
+            # 明确重来，而不是猜一个大概率错的。
+            cand = [(k, v) for k, v in _PENDING.items()
+                    if v.get("manual") and time.time() - v["created"] < 900]
+            if not cand:
+                raise HTTPException(400, "授权会话已过期，请重新点击授权")
+            if len(cand) > 1:
+                # 有多个候选：说明用户开了多个授权标签页。
+                # 逐个试代价太高（每次都是一个 400 请求，会烧 auth 配额），
+                # 而且猜错会浪费掉那次授权码。
+                raise HTTPException(
+                    400,
+                    f"同时有 {len(cand)} 个授权流程在进行，无法判断你粘贴的"
+                    f"授权码属于哪一个。请关掉多余的授权页，只保留一个，"
+                    f"重新点「添加账号」再试一次。",
+                )
+            used_state, pending = cand[0]
+            _PENDING.pop(used_state, None)
 
     try:
         bundle = await oauth.exchange_code(code, pending["verifier"], manual=True)
@@ -233,15 +267,17 @@ async def oauth_begin(name: str = "", relogin: int = 0,
         )
 
     state = secrets.token_urlsafe(16)
-    _PENDING[state] = {
-        "verifier": verifier,
-        "name": name.strip(),
-        "manual": True,
-        "relogin": int(relogin or 0),
-        "created": time.time(),
-    }
-    for k in [k for k, v in _PENDING.items() if time.time() - v["created"] > 900]:
-        _PENDING.pop(k, None)
+    with _PENDING_LOCK:
+        _PENDING[state] = {
+            "verifier": verifier,
+            "name": name.strip(),
+            "manual": True,
+            "relogin": int(relogin or 0),
+            "created": time.time(),
+        }
+        # 顺手清过期的（同一把锁内做，避免和并发兑换打架）
+        for k in [k for k, v in _PENDING.items() if time.time() - v["created"] > 900]:
+            _PENDING.pop(k, None)
 
     # 把 redirect_uri 记进 state，供回跳时比对（2026-10-25 加）。
     #
@@ -254,7 +290,9 @@ async def oauth_begin(name: str = "", relogin: int = 0,
     #   · 而不是白屏让他猜
     try:
         _cli = store.get_client(settings.public_url + oauth.MANUAL_REDIRECT_PATH)
-        _PENDING[state]["redirect_uri"] = (_cli or {}).get("redirect_uri", "")
+        with _PENDING_LOCK:
+            if state in _PENDING:
+                _PENDING[state]["redirect_uri"] = (_cli or {}).get("redirect_uri", "")
     except Exception:
         pass
 
@@ -418,7 +456,8 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
     弹窗场景下不直接跳首页——那样用户会以为打开了新网站。
     改为渲染简洁结果页：成功后自动关窗，并把结果 postMessage 给主窗口。
     """
-    pending = _PENDING.pop(state, None) if state else None
+    with _PENDING_LOCK:
+        pending = _PENDING.pop(state, None) if state else None
 
     if error:
         return _callback_page(False, f"授权被拒绝：{error}")
@@ -433,11 +472,32 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         return _callback_page(False, f"换取 token 失败：{e}")
 
     access = bundle["access_token"]
-    device_id = oauth.new_device_id()
+
+    # ⚠️ 同一 Picsart 账号（sub 相同）必须**沿用原来的 device_id**
+    # （2026-10-25 修，这是 fingerprint.py 引入的连锁问题）。
+    #
+    # 原来无脑 `new_device_id()`，后果有两个：
+    #   1. 指纹变了 —— fingerprint.py 用 device_id 做种子，
+    #      重新登录后同一个账号突然从 Chrome/132 Windows 变成
+    #      Chrome/137 macOS。上游看到"同一个账号换了设备"，
+    #      比不隔离更可疑（这正是我在 fingerprint.py 里明令禁止的
+    #      "不稳定指纹"）。
+    #   2. 上游会话 —— fetch_identity 带着新 device_id 去问身份，
+    #      等于以一台新设备身份登录，历史设备记录里会多出一条。
+    #
+    # 只有**全新的 Picsart 账号**才生成新 device_id。
+    _sub = ""
+    try:
+        _pre = oauth.parse_jwt(access)
+        _sub = str(_pre.get("sub") or "")
+    except Exception:
+        pass
+    _prev = _find_by_sub(_sub) if _sub else None
+    device_id = (_prev.get("device_id") if _prev else "") or oauth.new_device_id()
     ident = await oauth.fetch_identity(access, device_id)
 
     # 同一 Picsart 账号（sub 相同）重复授权时，更新原记录而不是新增
-    existing = _find_by_sub(ident.get("sub", ""))
+    existing = _find_by_sub(ident.get("sub", "")) or _prev
     base_name = (
         pending.get("name")
         or (existing["name"] if existing else "")
@@ -676,7 +736,31 @@ async def _store_oauth_account(
     会校验登录的 Picsart 账号和原记录是否同一个，防止授权错号。
     """
     access = bundle["access_token"]
-    device_id = oauth.new_device_id()
+
+    # ⚠️ 沿用原 device_id，别每次重新登录都换（2026-10-25 修）。
+    #
+    # fingerprint.py 用 device_id 作种子派生浏览器指纹。如果这里无脑
+    # new_device_id()，同一个 Picsart 账号在「重新登录」后会突然从
+    # Chrome/132 Windows 变成 Chrome/137 macOS —— 上游看到"同一账号换设备"，
+    # 比不做指纹隔离更可疑。
+    #
+    # 判断顺序：relogin 指定的那条 > 按 sub 找到的已有记录 > 新建。
+    # 前两者都拿它原来的 device_id。
+    _dev = ""
+    if relogin_id:
+        _row = store.get_account(relogin_id)
+        if _row:
+            _dev = str(_row.get("device_id") or "")
+    if not _dev:
+        try:
+            _pre = oauth.parse_jwt(access)
+            _sub = str(_pre.get("sub") or "")
+            _row = _find_by_sub(_sub) if _sub else None
+            if _row:
+                _dev = str(_row.get("device_id") or "")
+        except Exception:
+            pass
+    device_id = _dev or oauth.new_device_id()
     ident = await oauth.fetch_identity(access, device_id)
 
     # 优先按 Picsart 的 sub 匹配到已有记录（重新登录走这条），
@@ -838,8 +922,22 @@ async def add_by_cookie(body: CookieBody, _: dict = Depends(require_admin)):
 
     bearer = oauth.cookie_to_bearer(raw)
     if bearer:
-        # 探测和入库必须用同一个 device_id，否则 Picsart 侧看到的是两个设备
-        device_id = oauth.new_device_id()
+        # 探测和入库必须用同一个 device_id，否则 Picsart 侧看到的是两个设备。
+        #
+        # 但如果这个 token 对应的 Picsart 账号**已经在库里**，就沿用它的
+        # device_id —— 否则指纹会变（fingerprint.py 用 device_id 做种子），
+        # 而且上游会多出一条设备记录。同一个坑在 _store_oauth_account
+        # 里也踩过一次，这里是同一处修复的第二个入口。
+        _dev = ""
+        try:
+            _pre = oauth.parse_jwt(bearer)
+            _sub = str(_pre.get("sub") or "")
+            _row = _find_by_sub(_sub) if _sub else None
+            if _row:
+                _dev = str(_row.get("device_id") or "")
+        except Exception:
+            pass
+        device_id = _dev or oauth.new_device_id()
         try:
             ident = await oauth.fetch_identity(bearer, device_id, strict=True)
         except oauth.AuthError as e:
