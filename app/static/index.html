@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Picsart Wan3 号池</title>
+<link rel="stylesheet" href="/style.css">
+<!-- 兜底：即使样式表加载失败，也必须保证同一时刻只显示一个界面 -->
+<style>
+  #login, #app, #activate-view { display: none !important; }
+  body.mode-login    #login         { display: grid !important; }
+  body.mode-activate #activate-view { display: grid !important; }
+  body.mode-app      #app           { display: block !important; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════════
+     首屏是一个三态界面，由 boot() 按顺序判断：
+       ① 未激活   -> #activate-view（填激活码）
+       ② 已激活、未登录 -> #login（管理密码）
+       ③ 已激活、已登录 -> #app（主界面）
+
+     为什么未激活必须优先于登录：客户拿到链接第一件事是激活，
+     而不是登录。以前的顺序反了 —— 首屏是"请输入管理密码"，
+     客户既没有密码、也不知道该去哪激活，直接卡死。
+     激活页上要能看到自己的部署标识（要发给发卡方换卡）。
+     ══════════════════════════════════════════════════════════════ -->
+
+<!-- 激活（未激活时显示）-->
+<div id="activate-view" class="login">
+  <div class="login-card">
+    <h1>激活本应用</h1>
+    <p class="sub">把下面的部署标识发给发卡方换取激活码</p>
+
+    <label class="act-label">部署标识</label>
+    <code id="act-hwid" class="act-hwid">读取中…</code>
+    <button class="ghost mini act-copy" type="button" onclick="copyHwid()">复制</button>
+
+    <label class="act-label">激活码</label>
+    <form onsubmit="doActivate(event)">
+      <input id="act-card" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" autofocus>
+      <button class="primary" type="submit" id="act-go">激活</button>
+    </form>
+    <p id="act-msg" class="err"></p>
+    <p class="act-hint">
+      激活后本应用绑定这道部署标识。<br>
+      换机/重装请联系发卡方用同一标识解绑。
+    </p>
+    <!-- 联系方式。未激活的用户尤其需要它 —— 他手上还没有激活码，
+         "去哪买"必须在首屏就说清楚，只写在文档里等于没写。 -->
+    <p class="contact-line">
+      激活码 / 版本更新 请联系：<b class="contact-id" data-contact>Zzyuc88</b>
+    </p>
+  </div>
+</div>
+
+<!-- 登录（已激活但未登录）-->
+<div id="login" class="login">
+  <form class="login-card" onsubmit="doLogin(event)">
+    <h1>Picsart Wan3 号池</h1>
+    <p class="sub">请输入管理密码</p>
+    <input id="pw" type="password" placeholder="管理密码" autocomplete="current-password" autofocus>
+    <button class="primary" type="submit">进入</button>
+    <p id="login-err" class="err"></p>
+    <p class="contact-line">
+      忘记密码 / 需要协助：<b class="contact-id" data-contact>Zzyuc88</b>
+    </p>
+  </form>
+</div>
+
+<!-- 主界面 -->
+<div id="app">
+  <header>
+    <div class="brand">Picsart <span>Wan3 号池反代</span></div>
+    <!-- 联系方式常驻 header。放在 brand 之后、nav 之前：
+         客户遇到任何问题（激活、版本、加号失败）一眼就能找到人，
+         不用翻文档。hover 才高亮，不抢 nav 的视觉重心。 -->
+    <div class="contact-hd">
+      联系：<b class="contact-id" data-contact>Zzyuc88</b>
+    </div>
+    <nav>
+      <button class="tab active" data-tab="accounts">账号</button>
+      <button class="tab" data-tab="tasks">任务</button>
+      <button class="tab" data-tab="playground">调用测试</button>
+      <button class="tab" data-tab="usage">接入</button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+    <button class="ghost" onclick="doLogout()">退出</button>
+  </header>
+
+  <main>
+    <section id="tab-accounts" class="tab-panel active">
+      <div class="stat-row" id="stats"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>账号</h2>
+          <div class="head-actions">
+            <button class="ghost small" onclick="loadAll()">刷新</button>
+            <button class="primary small" onclick="openCreate()">+ 添加账号</button>
+          </div>
+        </div>
+        <p class="hint" style="margin:0 0 4px">
+          通过 Picsart 官方 OAuth 授权登录，自动获取长效 refresh_token 并定时续期。
+          号池按队列调度：一个账号在它手上的任务结束前不会接新任务。
+        </p>
+        <div class="table-wrap">
+          <table id="acc-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>Picsart 账号</th>
+                <th>状态</th>
+                <th>令牌</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 添加账号向导（OAuth） -->
+      <div id="create-modal" class="modal-mask hidden">
+        <div class="modal">
+          <div class="modal-head">
+            <h2 id="create-title">添加 Picsart 账号</h2>
+            <button class="icon-btn" onclick="closeCreate()" aria-label="关闭">✕</button>
+          </div>
+
+          <div class="steps">
+            <div class="step-item" id="step-dot-1">
+              <span class="dot">1</span><span class="step-label">基本信息</span>
+            </div>
+            <div class="step-line"></div>
+            <div class="step-item" id="step-dot-2">
+              <span class="dot">2</span><span class="step-label">授权登录</span>
+            </div>
+          </div>
+
+          <div class="modal-body">
+            <!-- Step 1 -->
+            <div id="create-step-1">
+              <div class="field">
+                <label>账号名称</label>
+                <input id="f-name" placeholder="留空自动用 Picsart 用户名">
+                <p class="input-hint">用于在号池里区分，重复时会自动改名</p>
+              </div>
+              <div class="field">
+                <label>备注</label>
+                <input id="f-notes" placeholder="可选，例如：7 天活动号">
+              </div>
+              <div class="field">
+                <div class="platform-badge">
+                  <span class="seg-dot" style="background:#ff3ea5"></span>
+                  Picsart AI Playground
+                  <span class="pb-hint">wan3 视频 · 免费档 480P / 720P</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Step 2 -->
+            <div id="create-step-2" class="hidden">
+              <div class="notice">
+                点下面按钮，在新标签页里登录 Picsart，登录后把页面显示的授权码复制回来。
+                <br>
+                <span class="dim" style="font-size:12px">
+                  多账号建议用无痕窗口逐个授权，否则浏览器已有会话会被静默复用。
+                </span>
+              </div>
+
+              <div class="field">
+                <button class="primary" id="btn-auth" onclick="startAuth()" style="width:100%">
+                  打开登录页
+                </button>
+              </div>
+
+              <div id="auth-status" class="input-hint" style="min-height:20px"></div>
+
+              <div class="field" style="margin-top:18px">
+                <label>把授权码粘回来 <span class="req">*</span></label>
+                <textarea id="f-code" rows="3"
+                  placeholder="登录页会显示一段授权码，整段复制粘到这里"></textarea>
+                <p class="input-hint">也支持直接粘贴完整回调 URL，会自动解析出 code</p>
+              </div>
+            </div>
+
+            <p id="create-err" class="err"></p>
+          </div>
+
+          <div class="modal-foot">
+            <button class="ghost hidden" id="btn-back" onclick="goStep(1)">上一步</button>
+            <span style="flex:1"></span>
+            <button class="ghost" onclick="closeCreate()">取消</button>
+            <button class="primary" id="btn-next" onclick="submitCreate()">完成</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-tasks" class="tab-panel">
+      <div class="stat-row" id="task-stats"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>任务</h2>
+          <div class="head-actions">
+            <label class="auto-toggle">
+              <input type="checkbox" id="auto-refresh" checked onchange="toggleAuto()">
+              自动刷新
+            </label>
+            <button class="ghost small" onclick="loadTasks()">刷新</button>
+          </div>
+        </div>
+        <p class="hint" style="margin:0 0 6px">
+          <b>排队中</b>：等可用账号，右边显示前面还有几个；
+          <b>生成中</b>：已占用账号，显示上游真实进度；
+          <b>状态未知</b>：上游超时但任务可能仍在跑。
+        </p>
+        <div class="table-wrap">
+          <table id="task-table">
+            <thead>
+              <tr>
+                <th>提交时间</th>
+                <th>状态</th>
+                <th>进度</th>
+                <th>参数</th>
+                <th>账号</th>
+                <th>耗时拆解</th>
+                <th>结果</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 任务详情（点开看完整提交参数） -->
+      <div id="task-modal" class="modal-mask hidden">
+        <div class="modal wide">
+          <div class="modal-head">
+            <h2 id="task-title">任务详情</h2>
+            <button class="icon-btn" onclick="closeTask()" aria-label="关闭">✕</button>
+          </div>
+          <div class="modal-body" id="task-body"></div>
+          <div class="modal-foot">
+            <span style="flex:1"></span>
+            <button class="ghost" onclick="closeTask()">关闭</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 调用测试：左栏调参、右栏看结果，照 fal / Recraft 的工作台形态做 -->
+    <section id="tab-playground" class="tab-panel">
+      <div class="pg-top">
+        <p class="hint" style="margin:0">
+          直接调反代接口，和外部调用方同一条路（含 API Key 校验）。
+          视频 <b>5 分钟起步</b>，提交后自动轮询到出片。
+        </p>
+        <div class="pg-top-right">
+          <label class="chk pg-key-chk" title="服务端设了 PICSART_POOL_API_KEYS 才需要">
+            <input type="checkbox" id="pg-key-on" onchange="pgToggleKey()"> 用 API Key
+          </label>
+          <input id="pg-key" type="password" class="hidden" placeholder="Bearer key"
+                 spellcheck="false" autocomplete="off">
+        </div>
+      </div>
+
+      <div class="pg-grid">
+        <!-- ============ 左：输入 ============ -->
+        <div class="pg-side">
+          <div class="pg-tabs" role="tablist">
+            <button class="pg-tab active" id="pg-tab-form" onclick="pgView('form')">表单</button>
+            <button class="pg-tab" id="pg-tab-json" onclick="pgView('json')">JSON</button>
+          </div>
+
+          <!-- 表单视图 -->
+          <div id="pg-form" class="pg-pane">
+            <div class="field">
+              <label class="pg-req">prompt <span class="pg-star">*</span></label>
+              <textarea id="pg-prompt" rows="5"
+                placeholder="一只金毛在海边沙滩上奔跑，夕阳，电影感">一只金毛在海边沙滩上奔跑，夕阳，电影感</textarea>
+              <p class="input-hint">
+                素材引用写 <code>图1</code>／<code>@名字</code> 均可；
+                图片、视频、音频<b>分别计数</b>。
+              </p>
+            </div>
+
+            <div class="pg-row">
+              <div class="field">
+                <label>resolution</label>
+                <select id="pg-resolution">
+                  <option>480P</option>
+                  <option selected>720P</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>ratio</label>
+                <select id="pg-ratio">
+                  <option>16:9</option><option>9:16</option><option>1:1</option>
+                  <option>4:3</option><option>3:4</option><option selected>adaptive</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>duration</label>
+                <input id="pg-duration" type="number" value="5" min="-1" max="30" step="1">
+              </div>
+            </div>
+
+            <!-- 素材：缩略图卡片 -->
+            <div class="field">
+              <label>素材</label>
+              <div id="pg-media-list" class="pg-media"></div>
+              <div class="pg-media-add">
+                <button class="ghost small" onclick="pgAddMedia('image')">+ 图片</button>
+                <button class="ghost small" onclick="pgAddMedia('video')">+ 视频</button>
+                <button class="ghost small" onclick="pgAddMedia('audio')">+ 音频</button>
+              </div>
+              <p class="input-hint">
+                填 URL 即可；填<b>名字</b>后可在 prompt 里用 <code>@名字</code> 引用。
+                上限：图 10 / 视频 5 / 音频 5。
+              </p>
+            </div>
+
+            <details class="pg-more">
+              <summary>高级设置</summary>
+              <div class="pg-row">
+                <div class="field">
+                  <label>negative_prompt</label>
+                  <input id="pg-negative" placeholder="不想出现的元素">
+                </div>
+                <div class="field">
+                  <label>seed</label>
+                  <input id="pg-seed" type="number" placeholder="留空 = 随机" min="0" max="2147483647" step="1">
+                </div>
+              </div>
+              <div class="pg-row">
+                <div class="field">
+                  <label>model</label>
+                  <input id="pg-model" value="wan-3.0-video" spellcheck="false">
+                </div>
+                <div class="field">
+                  <label>首帧 / 尾帧 URL</label>
+                  <div class="pg-key-row">
+                    <input id="pg-start" placeholder="start_frame" spellcheck="false">
+                    <input id="pg-end" placeholder="end_frame" spellcheck="false">
+                  </div>
+                </div>
+              </div>
+              <div class="pg-checks">
+                <label class="chk"><input type="checkbox" id="pg-wait" title="同步等待出片再返回，会占用连接数分钟">同步返回</label>
+                <label class="chk"><input type="checkbox" id="pg-audio">含音轨</label>
+                <label class="chk"><input type="checkbox" id="pg-watermark">加水印</label>
+                <label class="chk"><input type="checkbox" id="pg-thinking">深度思考</label>
+                <label class="chk"><input type="checkbox" id="pg-extend">prompt 改写</label>
+              </div>
+              <p class="input-hint">
+                同步返回会一直占着 HTTP 连接，网关容易超时 —— 默认异步即可。
+              </p>
+            </details>
+
+            <div class="pg-actions">
+              <button class="primary" id="pg-send" onclick="pgSend()">生成视频</button>
+              <button class="ghost" onclick="pgReset()">重置</button>
+            </div>
+          </div>
+
+          <!-- JSON 视图 -->
+          <div id="pg-json-pane" class="pg-pane hidden">
+            <p class="input-hint" style="margin:0 0 8px">
+              请求体以这里的内容为准。表单改动会同步进来，但手改后不会被覆盖。
+            </p>
+            <textarea id="pg-json" rows="20" spellcheck="false"></textarea>
+            <div class="pg-actions">
+              <button class="primary" onclick="pgSend()">发送这个 JSON</button>
+              <button class="ghost" onclick="pgSyncDown()">同步回表单</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ 右：结果 ============ -->
+        <div class="pg-out">
+          <div class="pg-tabs" role="tablist">
+            <button class="pg-tab active" id="pg-tab-preview" onclick="pgOut('preview')">预览</button>
+            <button class="pg-tab" id="pg-tab-resp" onclick="pgOut('resp')">响应 JSON</button>
+          </div>
+
+          <div id="pg-preview" class="pg-pane pg-stage">
+            <div id="pg-idle" class="pg-idle">
+              <div class="pg-idle-icon">▶</div>
+              <p>填好 prompt，点「生成视频」</p>
+              <p class="dim">任务 5 分钟起步，提交后这里会实时显示进度</p>
+            </div>
+            <div id="pg-run" class="hidden">
+              <div class="pg-run-head">
+                <span id="pg-status" class="dim">准备中</span>
+                <button class="ghost small hidden" id="pg-cancel" onclick="pgCancel()">停止轮询</button>
+              </div>
+              <div class="pg-bar"><i id="pg-bar-i"></i></div>
+              <div id="pg-video" class="pg-video hidden">
+                <video id="pg-player" controls preload="metadata" playsinline></video>
+                <div class="pg-video-foot">
+                  <a id="pg-dl" class="link" target="_blank" rel="noopener">在新标签页打开</a>
+                  <span id="pg-elapsed" class="dim"></span>
+                </div>
+              </div>
+              <div id="pg-fail" class="pg-fail hidden"></div>
+            </div>
+          </div>
+
+          <div id="pg-resp-pane" class="pg-pane hidden">
+            <pre id="pg-resp" class="pg-pre">还没有响应</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 底部：历史 + 复用 ============ -->
+      <div class="card">
+        <div class="card-head">
+          <h2>最近调用</h2>
+          <div class="head-actions">
+            <button class="ghost small" onclick="pgQuick('models')">GET /v1/models</button>
+            <button class="ghost small" onclick="pgQuick('credits')">GET /v1/credits</button>
+            <button class="ghost small" onclick="pgClearHist()">清空</button>
+          </div>
+        </div>
+        <p class="hint" style="margin:0 0 10px">
+          点任意一条可把它的参数灌回左栏接着改。示例：
+          <button class="ghost small" onclick="pgFill('图生视频')">图生视频</button>
+          <button class="ghost small" onclick="pgFill('首尾帧')">首尾帧</button>
+          <button class="ghost small" onclick="pgFill('多素材')">多素材 @名字</button>
+        </p>
+        <div id="pg-hist" class="pg-hist">
+          <p class="dim" style="margin:0">还没有记录。发一次请求就会出现在这里。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-usage" class="tab-panel">
+      <p class="hint" style="margin:0">
+        Base URL：<code id="usage-base"></code> ·
+        鉴权：<code>Authorization: Bearer &lt;API_KEY&gt;</code> ·
+        Content-Type：<code>application/json</code>
+      </p>
+
+      <!-- 下载接口文档（Markdown）
+           用户通常是把这份文档直接丢给 AI（Claude/ChatGPT/Cursor）让它写调用代码。
+           所以必须是纯文本 Markdown —— AI 吃 Markdown 最省事，人也能直接看。
+           内容由后端 /api/docs 现生成（带真实 Base URL 和当前配置），
+           不是静态文件，所以不会出现"文档说 720P、实际改了配置"的漂移。 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>给 AI 的接口文档</h2>
+          <div class="head-actions">
+            <button class="ghost small" onclick="copyDocs()">复制全文</button>
+            <button class="primary small" onclick="downloadDocs()">下载 .md</button>
+          </div>
+        </div>
+        <p class="hint" style="margin:0">
+          一份自包含的 Markdown：端点、参数、素材引用规则、错误码、调用示例。
+          把文件直接拖给 AI，它就能写出能跑的调用代码 —— 不需要你再解释一遍。
+          <br>
+          文档里的 Base URL 用当前访问地址现填，换域名/换端口都不会失效。
+        </p>
+      </div>
+
+      <!-- 快速开始 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>快速开始</h2>
+          <button class="ghost small" onclick="copyCurl()">复制</button>
+        </div>
+        <pre id="curl-demo"></pre>
+      </div>
+
+      <!-- 端点总览 -->
+      <div class="card">
+        <h2>端点</h2>
+        <table class="api-tbl">
+          <thead><tr><th>方法与路径</th><th>说明</th><th>返回</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>POST /v1/videos/generations</code></td>
+              <td>生成视频。默认异步</td>
+              <td><code>202</code> 带 <code>id</code></td>
+            </tr>
+            <tr>
+              <td><code>GET /v1/videos/generations/{id}</code></td>
+              <td>查任务状态与结果</td>
+              <td><code>200</code></td>
+            </tr>
+            <tr>
+              <td><code>GET /v1/models</code></td>
+              <td>可用模型（只列免费档）</td>
+              <td><code>200</code></td>
+            </tr>
+            <tr>
+              <td><code>GET /v1/credits</code></td>
+              <td>号池可用账号数</td>
+              <td><code>200</code></td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="hint" style="margin:10px 0 0">
+          这个服务只跑 <b>0 积分</b>档：<b>480P / 720P</b>，时长 <b>2–30 秒</b>，任意画幅。
+          <b>1080P</b> 和 <b>prime</b> 会扣积分，直接 <code>400</code> 拒绝，不静默降级。
+        </p>
+      </div>
+
+      <!-- 请求参数 -->
+      <div class="card">
+        <h2>请求参数</h2>
+        <table class="api-tbl">
+          <thead><tr><th>字段</th><th>类型</th><th>默认</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td><code>prompt</code></td><td>string</td><td>—</td><td>提示词。和 <code>media</code> 至少给一个</td></tr>
+            <tr><td><code>model</code></td><td>string</td><td><code>wan-3.0-video</code></td><td>只接受这一个值</td></tr>
+            <tr><td><code>resolution</code></td><td>string</td><td><code>720P</code></td><td><code>480P</code> / <code>720P</code></td></tr>
+            <tr><td><code>duration</code></td><td>int</td><td><code>5</code></td><td><code>-1</code>（智能）或 <code>2</code>~<code>30</code></td></tr>
+            <tr><td><code>ratio</code></td><td>string</td><td><code>adaptive</code></td><td><code>16:9</code> <code>9:16</code> <code>1:1</code> <code>4:3</code> <code>3:4</code> <code>adaptive</code></td></tr>
+            <tr><td><code>audio</code></td><td>bool</td><td><code>false</code></td><td>输出是否含音轨</td></tr>
+            <tr><td><code>negative_prompt</code></td><td>string</td><td>—</td><td>负向提示词</td></tr>
+            <tr><td><code>seed</code></td><td>int</td><td>—</td><td><code>0</code>~<code>2147483647</code></td></tr>
+            <tr><td><code>enable_thinking</code></td><td>bool</td><td><code>false</code></td><td>深度思考</td></tr>
+            <tr><td><code>watermark</code></td><td>bool</td><td><code>false</code></td><td>是否加水印</td></tr>
+            <tr><td><code>prompt_extend</code></td><td>bool</td><td>—</td><td>提示词智能改写（网关不保证生效）</td></tr>
+            <tr><td><code>wait</code></td><td>bool</td><td><code>false</code></td><td><code>true</code> = 同步等出片再返回</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- 素材字段 -->
+      <div class="card">
+        <h2>素材字段</h2>
+        <table class="api-tbl">
+          <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td><code>start_frame</code></td><td>string</td><td>首帧图 URL</td></tr>
+            <tr><td><code>end_frame</code></td><td>string</td><td>尾帧图 URL（必须配 <code>start_frame</code>）</td></tr>
+            <tr><td><code>image_urls</code></td><td>array</td><td>参考图。元素是 URL，或 <code>{url, name}</code></td></tr>
+            <tr><td><code>video_urls</code></td><td>array</td><td>参考视频，同上</td></tr>
+            <tr><td><code>audio_urls</code></td><td>array</td><td>参考音频，同上</td></tr>
+            <tr><td><code>media</code></td><td>array</td><td>上游原生数组，<code>{type, url, name?}</code></td></tr>
+          </tbody>
+        </table>
+        <p class="hint" style="margin:10px 0 0">
+          也接受单数字段 <code>image</code> / <code>video</code> / <code>audio_url</code>。
+          别名：<code>aspect_ratio</code> 等价 <code>ratio</code>；<code>size: "1280x720"</code> 会换算成 <code>ratio</code>。
+        </p>
+      </div>
+
+      <!-- 素材编号规则 -->
+      <div class="card">
+        <h2>素材引用：图N / @名字</h2>
+        <p class="hint" style="margin:0 0 10px">
+          素材按数组顺序编号，<b>图片、视频、音频分别计数</b>。
+          数组 <code>[图, 视频, 图, 图]</code> → 编号为 图1、视频1、图2、图3。
+          两个及以上素材时<b>必须写明编号</b>；只有一个时可简写。
+        </p>
+        <pre id="usage-media-demo"></pre>
+        <p class="hint" style="margin:10px 0 0">
+          给素材起 <code>name</code> 后可在 prompt 里用 <code>@名字</code> 引用，服务会自动换成 <code>图N</code>
+          并附上「素材对应」说明。<code>name</code> 不会上传，上游只认 <code>图N</code>。
+        </p>
+      </div>
+
+      <!-- 组合规则 -->
+      <div class="card">
+        <h2>素材组合规则</h2>
+        <div class="api-cols">
+          <div>
+            <h3 class="ok-h">允许</h3>
+            <ul class="api-list">
+              <li>参考图 / 视频 / 音频自由组合</li>
+              <li><code>file</code> 或 <code>link</code> 可与 <code>reference_*</code> 组合</li>
+              <li>仅 <code>first_frame</code>，或 <code>first_frame</code> + <code>last_frame</code></li>
+            </ul>
+          </div>
+          <div>
+            <h3 class="bad-h">禁止（本地拦下，400）</h3>
+            <ul class="api-list">
+              <li>首尾帧与任何其他素材混用（含 <code>file</code> / <code>link</code>）</li>
+              <li><code>file</code> 和 <code>link</code> 同时出现</li>
+              <li>只有 <code>last_frame</code> 没有 <code>first_frame</code></li>
+            </ul>
+          </div>
+        </div>
+        <p class="hint" style="margin:12px 0 0">
+          数量上限：参考图 <b>10</b> · 参考视频 <b>5</b> 段（总时长 ≤15s）· 参考音频 <b>5</b> 段（≤15s）·
+          首/尾帧各 <b>1</b> · <code>file</code> / <code>link</code> 各 <b>1</b>。
+        </p>
+        <p class="hint" style="margin:6px 0 0">
+          格式：图片 JPEG/PNG(无透明)/BMP/WEBP，单边 240–8000px，≤20MB；
+          视频 mp4/mov，单段 1–15s，≥16fps，≤100MB；
+          音频 wav/mp3，单段 1–15s，≤15MB。
+        </p>
+      </div>
+
+      <!-- 响应 -->
+      <div class="card">
+        <h2>响应</h2>
+        <p class="hint" style="margin:0 0 8px"><b>异步提交</b>（<code>wait</code> 缺省或 <code>false</code>）：</p>
+        <pre>HTTP 202
+{
+  "id": "vtask_3e9318bbfe9f4e2a8654dff3",
+  "object": "video.generation",
+  "status": "queued",
+  "poll": "/v1/videos/generations/vtask_3e9318bbfe9f4e2a8654dff3"
+}</pre>
+        <p class="hint" style="margin:12px 0 8px"><b>查询进行中</b>：</p>
+        <pre>{
+  "id": "vtask_3e9318bbfe9f4e2a8654dff3",
+  "status": "in_progress",
+  "model": "wan3.0-video",
+  "resolution": "720P",
+  "created": 1792775030,
+  "account": "main",
+  "progress": 45
+}</pre>
+        <p class="hint" style="margin:12px 0 8px"><b>查询完成</b>：</p>
+        <pre>{
+  "id": "vtask_3e9318bbfe9f4e2a8654dff3",
+  "status": "completed",
+  "progress": 100,
+  "url": "https://gcdn.picsart.com/editing-temp/xxx.mp4",
+  "elapsed": 91.1
+}</pre>
+        <table class="api-tbl" style="margin-top:14px">
+          <thead><tr><th><code>status</code></th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td><code>queued</code></td><td>已入队，等号池分配账号</td></tr>
+            <tr><td><code>in_progress</code></td><td>上游生成中，<code>progress</code> 是百分比</td></tr>
+            <tr><td><code>completed</code></td><td>完成，<code>url</code> 可用</td></tr>
+            <tr><td><code>failed</code></td><td>失败，<code>error</code> 说明原因</td></tr>
+          </tbody>
+        </table>
+        <p class="hint" style="margin:10px 0 0">
+          <b>轮询间隔 10–15 秒。</b>任务本身耗时数分钟，轮询太快没意义还会被限流。
+          <code>progress</code> 来自上游真实进度（0–100），上游到 80% 算完成，这里归一到 100。
+        </p>
+      </div>
+
+      <!-- 错误码 -->
+      <div class="card">
+        <h2>错误码</h2>
+        <table class="api-tbl">
+          <thead><tr><th>HTTP</th><th><code>detail</code> 示例</th><th>处理</th></tr></thead>
+          <tbody>
+            <tr><td><code>400</code></td><td><code>1080P 要扣积分（5 秒 30 积分）…</code></td><td>改 <code>480P</code> / <code>720P</code></td></tr>
+            <tr><td><code>400</code></td><td><code>resolution 只能是 480P / 720P，收到 '2K'</code></td><td>按提示改</td></tr>
+            <tr><td><code>400</code></td><td><code>media.0.type 必须是 … 之一</code></td><td>素材类型非法</td></tr>
+            <tr><td><code>400</code></td><td><code>首尾帧…不能和其他任何素材混用</code></td><td>二选一</td></tr>
+            <tr><td><code>400</code></td><td><code>prompt 或至少一个媒体输入必填</code></td><td>补内容</td></tr>
+            <tr><td><code>401</code></td><td><code>invalid api key</code></td><td>检查 key</td></tr>
+            <tr><td><code>402</code></td><td><code>额度不足（402）。免费档只能用 480P / 720P</code></td><td>换号或等恢复</td></tr>
+            <tr><td><code>429</code></td><td><code>该账号并发被占用（同时只能跑 1 个任务）</code></td><td>退避重试</td></tr>
+            <tr><td><code>503</code></td><td><code>号池无可用账号（全部忙 / 冷却 / 失效）</code></td><td>稍后重试 / 补号</td></tr>
+            <tr><td><code>503</code></td><td><code>上游并发名额被占用（该账号有任务在跑…）</code></td><td>退避 30s+ 重试</td></tr>
+          </tbody>
+        </table>
+        <p class="hint" style="margin:10px 0 0">
+          错误文案是全中文人话，不透出上游 reason code。
+        </p>
+      </div>
+
+      <!-- 注意事项 -->
+      <div class="card">
+        <h2>注意事项</h2>
+        <ul class="api-list api-list-lg">
+          <li><b>并发</b>：每个 Picsart 账号同时只能跑 1 个任务，号池里 N 个号 = N 路并发。池子全忙返回 <code>503</code>，<b>不是 <code>429</code></b>（429 只在提交瞬间撞上占用时出现）。</li>
+          <li><b>耗时</b>：实测 5 秒视频 <b>91 秒 ~ 23 分钟</b>，取决于上游排队，不要假设固定时长。</li>
+          <li><b>成片 URL</b>：指向 <code>gcdn.picsart.com</code>，可直接下载，但上游可能清理临时目录 —— <b>建议自行转存</b>。</li>
+          <li><b>不保证幂等</b>：网络重试可能重复提交，请用返回的 <code>id</code> 去重，不要盲目重发 POST。</li>
+          <li><b>prompt_extend</b>：会转发给上游但不保证生效（网关不做类型校验），想稳定控制输出就用明确的 prompt。</li>
+          <li><b>与阿里云官方文档的差异</b>（以本服务为准）：官方 <code>ratio</code> 支持 <code>21:9</code>，Picsart 不支持；官方 <code>seed</code> 支持 <code>-1</code>，这里必须 <code>0</code> 起；官方 duration 有「输入视频总时长+输出时长≤30」的组合约束，这里只做枚举校验。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="tab-panel">
+      <div class="card">
+        <h2>运行配置</h2>
+        <table class="kv" id="cfg-table"></table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

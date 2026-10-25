@@ -1,0 +1,14 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+jinja2==3.1.5
+python-multipart==0.0.20
+
+# Ed25519 验签 / AES-GCM / HKDF —— 授权门（workbuddy/gate.py）用。
+#
+# ⚠️ 这一条是 2026-10-25 补的，之前漏了：`app/` 本身不需要它，
+# 所以最初的 requirements 里没有；而 `workbuddy/gate.py` 一做激活校验
+# 就 import 它。漏掉的后果是沙盒里 `pip install` 装不上它，
+# 进程启动时直接 ImportError —— 表现是白屏/502，且日志里只有一行 traceback，
+# 很容易被当成"端口配错了"去查。
+cryptography==44.0.0

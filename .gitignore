@@ -1,0 +1,43 @@
+# 数据与凭证（绝对不要提交）
+data/
+_site/
+*.db
+*.db-wal
+*.db-shm
+license.dat
+lic.ok
+lic.ver
+lic.ver.bak
+deploy.id
+session.secret
+.admin_token
+
+# 证书与私钥
+*.pem
+*.key
+*.p12
+*.pfx
+certs/
+keys/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 构建产物
+dist/
+build/
+*.exe
+*.zip
