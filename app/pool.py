@@ -480,7 +480,11 @@ class Pool:
             self._ready_at[aid] = now
             n += 1
         if n:
-            self._dispatch()
+            # 用 _dispatch_all 而不是 _dispatch（2026-10-25 修）：
+            # 这里可能一次兑现多个号，而 _dispatch 一次只唤醒一个等待者。
+            # 只调一次的话，N 个号里只有 1 个被派出去，其余留在 ready 里
+            # 干等下一轮探测 —— 客户看到的就是"有号却派不出去"。
+            self._dispatch_all()
         return n
 
     def _next_pending_wake(self) -> float:
@@ -501,10 +505,27 @@ class Pool:
     def _dispatch(self) -> None:
         """把可用号按 FIFO 顺序派给等待者。
 
-        只处理**已经失效或已完成**的 Future，绝不无限循环 ——
-        每个 Future 只被 set 一次，由等待方自己负责重试或退出。
+        **每调一次只唤醒一个等待者**（这是刻意的，见下），但会先清掉
+        所有已失效的等待者。
+
+        为什么一次只唤醒一个：
+          1000 个协程同时被 set() 唤醒会同时发现同一个可用号、同时抢锁，
+          999 个失败方各跑一轮循环 —— CPU 空转（惊群），且长任务会被
+          反复排在后面。按 FIFO 只唤醒队首，既省 CPU 又保证顺序公平。
+
+        ⚠️ 那"多个号 + 多个等待者"怎么办（2026-10-25 修）：
+          一次只派一个，剩下的号留在 ready 里等下一次 _dispatch。
+          所以**调用方必须能可靠地反复调用**，否则就会出现
+          「ready 里有号 + 有任务在排，但没人派」的死锁。
+
+          现在的保障有三层：
+            · _probe_loop 每轮开头无条件调一次
+            · _flush_pending_ready 兑现后调一次
+            · _announce_ready 宣告后调一次
+          而每轮的探测周期是 PROBE_INTERVAL(5s)，所以最坏情况
+          多等 5 秒就能再派出一个 —— 不会无限期卡住。
         """
-        while self._ready and self._waiters:
+        while self._waiters:
             fut, deadline = self._waiters[0]
             if fut.done():
                 # 等待方已经不等了（超时/取消），摘掉继续看下一个
@@ -514,9 +535,30 @@ class Pool:
                 # 已超时：摘掉，让它在自己的协程里报错
                 self._waiters.popleft()
                 continue
+            if not self._ready:
+                return              # 没有可用号，等待者继续排队
             fut.set_result(True)
             self._waiters.popleft()
             return
+
+    def _dispatch_all(self) -> int:
+        """反复派发直到派不动为止。返回本次派出去几个。
+
+        专供"一次涌入多个号"的场景（比如 _flush_pending_ready 兑现了
+        一批待宣告号）。普通路径用 _dispatch 就够 —— 一次一个更公平。
+
+        ⚠️ 不能简单地在 while 里调 _dispatch()：_dispatch 在
+        `not self._ready` 时直接 return，没有"派不动了"的信号，
+        循环会退化成无限重试同一个失败。所以这里显式判断条件。
+        """
+        n = 0
+        while self._ready and self._waiters:
+            before = len(self._waiters)
+            self._dispatch()
+            if len(self._waiters) == before:
+                break               # 没有进展（全部失效/超时被摘除）
+            n += 1
+        return n
 
     def _withdraw_ready(self, aid: int, why: str = "") -> None:
         """把号从可用集合里撤下来（占用 / 名额被占 / 出错）。"""
@@ -637,6 +679,18 @@ class Pool:
                     wait = d
                 await asyncio.sleep(wait)
 
+                # ---- 每轮先补派一次（2026-10-25 修死锁）----
+                #
+                # 放在最前面，不受下面任何 continue 影响。原因见循环末尾那段
+                # 长注释：`_announce_ready` 只在号**第一次**进 ready 时调
+                # _dispatch，而 _dispatch 一次只唤醒一个等待者 —— 于是
+                # 「ready 里还有号 + 还有任务在排」这个组合没人负责派出去，
+                # 任务会一直等到超时。客户看到的是"有号却派不出去"。
+                #
+                # 成本：_dispatch 开头就是 `while self._ready and self._waiters`，
+                # 任一为空立即返回，几乎零开销。
+                self._dispatch()
+
                 # ⚠️ 未激活时**不碰上游**（对齐 Go 版 pool.go:1226）。
                 #
                 # 为什么必须这道闸：
@@ -686,6 +740,7 @@ class Pool:
                 # 兑现"宽限期已到"的待宣告号。
                 # 必须在上面那轮探测之后：它可能刚把号记进 _pending_ready，
                 # 同一轮就兑现掉，不用再等一个节拍。
+                # （_flush_pending_ready 内部会自己调 _dispatch，这里不重复调。）
                 self._flush_pending_ready()
             except asyncio.CancelledError:
                 raise
