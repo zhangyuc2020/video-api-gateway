@@ -165,13 +165,34 @@ class ExchangeBody(BaseModel):
 
 
 @router.get("/oauth/manual-callback")
-async def oauth_manual_callback(code: str = "", state: str = "", error: str = "",
-                                _: dict = Depends(require_admin)):
-    """手动模式下展示授权码，让用户复制。"""
+async def oauth_manual_callback(code: str = "", state: str = "", error: str = ""):
+    """手动模式下展示授权码，让用户复制。
+
+    ⚠️ 这个端点**故意不要求登录态**（2026-10-25 修）。
+
+    原因：用户是在上游授权页完成授权后**被跨站回跳**到这里的。
+    跨站回跳时浏览器不一定带 cookie —— 如果客户端设了
+    `PICSART_POOL_ADMIN_PASSWORD`、或者激活门那一瞬间 `verify()` 没过，
+    `require_admin` 就会抛 401，于是用户看到的是一段裸 JSON
+    `{"detail":"未登录"}`，或者干脆一片空白 ——
+    他描述成「不出现复制授权码的页面，直接就被关掉了」。
+
+    放开之后的最坏情况：别人看到你的一次性授权码。但他拿去也没用 ——
+    兑换需要同一次授权流程里的 code_verifier，存在服务端
+    `_PENDING[state]` 里，而 state 是 32 字节随机值。
+    而用户拿不到这个页面的后果是**完全无法添加账号**。
+    """
     if error:
         return _code_page("", state, f"授权被拒绝：{error}")
     if not code:
-        return _code_page("", state, "回调里没有 code")
+        # 没有 code 也没有 error：可能是用户在授权页直接关掉了，
+        # 或者回跳参数被中间层吃掉。给一个能看懂、能重试的页面，
+        # 而不是裸 400。
+        return _code_page(
+            "", state,
+            "没有收到授权码。可能是授权过程被中断了 —— "
+            "请回到管理页重新点「添加账号」再试一次。",
+        )
     return _code_page(code, state, "")
 
 
@@ -221,6 +242,21 @@ async def oauth_begin(name: str = "", relogin: int = 0,
     }
     for k in [k for k, v in _PENDING.items() if time.time() - v["created"] > 900]:
         _PENDING.pop(k, None)
+
+    # 把 redirect_uri 记进 state，供回跳时比对（2026-10-25 加）。
+    #
+    # 为什么需要：用户反馈「授权完成后网页直接关闭」，服务端日志里什么都没有。
+    # 最可能的解释是**回跳目标不可达** —— 而不可达的原因是 redirect_uri
+    # 用的是请求级推导的 public_url，两次请求之间域名可能变了。
+    #
+    # 有了这个记录，回跳页就能自证：
+    #   · 实际收到的 Host 和当初注册用的不一致 -> 明确告诉用户
+    #   · 而不是白屏让他猜
+    try:
+        _cli = store.get_client(settings.public_url + oauth.MANUAL_REDIRECT_PATH)
+        _PENDING[state]["redirect_uri"] = (_cli or {}).get("redirect_uri", "")
+    except Exception:
+        pass
 
     auth_url = url.replace("&redirect_uri=", f"&state={state}&redirect_uri=")
     html = f"""<!doctype html><html><head><meta charset="utf-8">

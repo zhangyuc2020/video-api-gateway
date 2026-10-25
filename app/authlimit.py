@@ -44,6 +44,11 @@ class TokenRateLimiter:
         self._blocked_until = 0.0
         self._block_reason = ""
 
+        # 连续被限流的次数。驱动指数退避阶梯（30 -> 60 -> 120 ...）。
+        # 刷新成功时由 reset_streak() 清零 —— 不重置的话，一整天零星的
+        # 限流会累积成"连续第 N 次"，退避永远停在封顶，而实际早就恢复了。
+        self._streak = 0
+
     # ------------------------------------------------------------ 熔断
 
     @property
@@ -61,19 +66,71 @@ class TokenRateLimiter:
             self._block_reason = reason or "auth 端点限流"
 
     def block_from_response(self, retry_after: str | None, status: int) -> float:
-        """从 429 响应里解析 retry-after 并熔断。
+        """收到 429/1015 时决定熔断多久。**指数退避**，不是一刀切。
 
-        Cloudflare 的 1015 页面固定带 `retry-after`，没有就保守按 60s。
+        依据（Cloudflare 官方，2026 年新增的机器可读错误）：
+        ---------------------------------------------------
+        https://developers.cloudflare.com/changelog/post/2026-03-12-retry-after-header-for-1xxx-errors/
+
+          Error 1015 (Rate limited): Retry-After = 30
+
+        官方给客户端的指示（`what_you_should_do` 字段原文）：
+
+            Wait and retry. This block is transient.
+            Wait at least 30 seconds, then retry with exponential backoff.
+            1. Wait 30 seconds before your next request
+            2. If rate-limited again, double the wait time (60s, 120s, etc.)
+            3. If rate-limiting persists after 5 retries, stop and reassess
+
+        所以正确做法是「先等 30s 试一次，还封就翻倍」，而不是：
+          · 无条件相信 retry-after（服务端可能给 3600）
+          · 或一刀切等 900s（瞬时抖动也要白等 15 分钟）
+
+        历史教训（这个模块第一版的注释）：
+          · 一晚上对 token 端点打约 70 次 -> 1015，IP 被临时封
+          · 重复触发会让 1015 升级成 1020（永久规则），
+            因为站点所有者看到某 IP 反复冲击限流，会针对性写死规则
+          · 所以"温和但持续"比"猛烈重试"安全得多
+
+        退避阶梯：30 -> 60 -> 120 -> 240 -> 480 -> 900（封顶）
+        连续第 5 次仍被封就停在 900s，不再涨 —— 继续涨也没有额外收益，
+        反而让用户在真正恢复后还多等。
         """
-        secs = 60.0
+        # 服务端给的 retry-after 优先（它是权威的），但**不作为下界**：
+        # 如果它给了 3600 而我们是第一次撞上，先按 30 试一次更划算。
+        server_hint = 0.0
         if retry_after:
             try:
-                secs = float(str(retry_after).strip())
+                server_hint = float(str(retry_after).strip())
             except (TypeError, ValueError):
-                secs = 60.0
-        secs = max(5.0, min(secs, 3600.0))
-        self.block(secs, f"HTTP {status}")
+                server_hint = 0.0
+
+        if self._streak <= 0:
+            # 这一轮第一次被封：按官方建议从 30s 起
+            secs = 30.0
+            # 除非服务端给了更小的（比如 5s），那就听它的
+            if 0 < server_hint < secs:
+                secs = server_hint
+        else:
+            # 连续第 N 次：翻倍
+            secs = min(900.0, 30.0 * (2 ** self._streak))
+            # 服务端给的更长就采纳（但不超过封顶）
+            if server_hint > secs:
+                secs = min(900.0, server_hint)
+
+        secs = max(5.0, min(secs, 900.0))
+        self._streak += 1
+        self.block(secs, f"HTTP {status}（连续第 {self._streak} 次）")
         return secs
+
+    def reset_streak(self) -> None:
+        """成功过一次就清零退避阶梯。
+
+        调用点：oauth 刷新成功时。不调用的话，一整天零星的限流会
+        累积成"连续第 8 次"，退避永远停在 900s —— 而实际上中间
+        成功过很多次，早就该从头算了。
+        """
+        self._streak = 0
 
     # ------------------------------------------------------------ 令牌桶
 

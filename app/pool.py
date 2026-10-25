@@ -95,11 +95,26 @@ SUBMIT_MAX_TRIES = 3
 # PROBE_INTERVAL：后台多久扫一轮空闲号。
 # PROBE_TTL     ：同一个号多久内不重复打上游 options（节流）。
 #
-# 5s/10s 是权衡：上游名额释放通常是秒级，太慢会让任务白等；
-# 太快则 options 请求量 = 账号数 / TTL，100 个号也就 10 QPS，
-# 对 api.picsart.com 完全可接受，且不进 workflows 的并发计数。
+# ⚠️ PROBE_TTL 从 10s 改成 60s（2026-10-25）。
+#
+# 为什么改 —— 这是 Cloudflare 1015 的真正来源，不是 token 续期：
+#
+#   auth 续期：3 个号 × 每 25 分钟一次 ≈ 8.9 次/小时
+#   options 探测：3 个号 × 每 10 秒一次 ≈ 1080 次/小时   ← 差 121 倍
+#
+# 客户现场就是 3 个号，一眼看去"待续期"以为是 token 问题，
+# 实际是探测把 Cloudflare 的 IP 计数器打满了，然后续期被连带限流。
+#
+# 为什么调大 TTL 不影响派发速度（这一点必须确认过才敢改）：
+#   任务真正要拿号时走的是 `probe_slot(force=True)`（见 _try_claim），
+#   它**绕过 TTL 直接探测**。所以 TTL 只影响"后台预热"的刷新频率，
+#   不影响"有任务来了"的响应速度。
+#
+# 代价：号从"忙"变"闲"时，后台最多晚 60s 才发现（以前 10s）。
+# 但上游名额释放本身就要几秒到几十秒，而且排队的任务会 force 探测，
+# 所以实际感知差异很小。
 PROBE_INTERVAL = 5.0
-PROBE_TTL = 10.0
+PROBE_TTL = 60.0
 
 # RELEASE_GRACE：任务结束后多久内**不许**宣告这个号可用。
 #
@@ -705,6 +720,24 @@ class Pool:
         只会反复打 auth 端点、把 IP 往 Cloudflare 1015 上推。
         """
         now = time.time()
+
+        # ⚠️ 熔断期间**整轮跳过**（2026-10-25 修）。
+        #
+        # 以前没有这个判断，后果是：熔断一触发，这一轮会把每个待续期的号
+        # 都走一遍 ensure_fresh -> oauth.refresh -> 立刻抛 rate_limited ->
+        # 回写 cooldown_until。于是：
+        #
+        #   1. 每个号都被写上一次 cooldown，UI 上变成「三行都是待续期」，
+        #      用户以为三个号全坏了，实际是**一个全局冷却**。
+        #   2. cooldown 的秒数取的是 blocked_for()，而它随时间递减 ——
+        #      三个号会显示 284s / 283s / 283s 这种"几乎一样但不同"的数字，
+        #      更像"每个号各自出了问题"。
+        #   3. 每次循环都白跑一遍全表。
+        #
+        # 熔断是全局状态，就该在循环入口一次性判断掉。
+        if authlimit.limiter().blocked:
+            return
+
         for a in store.list_accounts():
             if not a.get("refresh_token"):
                 continue

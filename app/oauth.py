@@ -307,6 +307,12 @@ async def _raw_refresh(refresh_token: str, client_id: str = "") -> dict[str, Any
     data = _json_or_text(r)
     if r.status_code != 200 or "access_token" not in data:
         raise AuthError("refresh_failed", data)
+    # 刷新成功 -> 清掉指数退避阶梯（2026-10-25 加）。
+    #
+    # 不调用的话，一整天零星的限流会累积成"连续第 8 次"，
+    # 退避永远停在 900s 封顶 —— 而实际上中间成功过很多次，
+    # 早该从头按 30s 起了。
+    lim.reset_streak()
     return data
 
 
