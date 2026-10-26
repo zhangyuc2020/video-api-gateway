@@ -182,13 +182,21 @@
               </div>
             </div>
 
-            <!-- Step 2 -->
+            <!-- Step 2：自动回调（2026-10-26 改）
+                 以前让用户手动复制授权码 —— 但那条路依赖浏览器能停在
+                 我们的授权码页面上，在沙箱环境里标签页会被上游关掉，
+                 客户根本看不到码。现在改成：点按钮 -> 登录 -> 我们自动
+                 收结果，用户不用复制任何东西。 -->
             <div id="create-step-2" class="hidden">
               <div class="notice">
-                点下面按钮，在新标签页里登录 Picsart，登录后把页面显示的授权码复制回来。
+                点下面的按钮登录 Picsart。<b>登录完成后会自动完成授权，不需要你复制任何东西。</b>
                 <br>
                 <span class="dim" style="font-size:12px">
-                  多账号建议用无痕窗口逐个授权，否则浏览器已有会话会被静默复用。
+                  如果标签页自己关掉了，那是正常的 —— 回到这个页面看提示即可。
+                </span>
+                <br>
+                <span class="dim" style="font-size:12px">
+                  多账号建议用无痕窗口逐个授权，否则浏览器已有会话可能被静默复用成同一个账号。
                 </span>
               </div>
 
@@ -200,11 +208,19 @@
 
               <div id="auth-status" class="input-hint" style="min-height:20px"></div>
 
-              <div class="field" style="margin-top:18px">
-                <label>把授权码粘回来 <span class="req">*</span></label>
-                <textarea id="f-code" rows="3"
-                  placeholder="登录页会显示一段授权码，整段复制粘到这里"></textarea>
-                <p class="input-hint">也支持直接粘贴完整回调 URL，会自动解析出 code</p>
+              <!-- 手动兑换的入口保留但默认隐藏：
+                   万一自动回调因为网络/代理失败，用户还能把回调 URL
+                   粘进来手动完成。不给普通用户看，避免增加理解成本。 -->
+              <div id="manual-exchange" class="hidden" style="margin-top:16px">
+                <div class="field">
+                  <label>自动接收失败？把登录后的地址粘进来</label>
+                  <textarea id="f-code" rows="3"
+                    placeholder="https://.../oauth/callback?code=..."></textarea>
+                  <p class="input-hint">
+                    登录页跳转后地址栏里那一整段 URL，复制粘到这里即可
+                  </p>
+                </div>
+                <button class="ghost" onclick="doExchange()">手动完成授权</button>
               </div>
             </div>
 

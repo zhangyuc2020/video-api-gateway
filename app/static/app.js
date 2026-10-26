@@ -1424,8 +1424,12 @@ function goStep(n) {
 }
 
 function submitCreate() {
+  // 第二步不再"提交"什么 —— 授权是自动完成的（回跳时后端就入库了）。
+  // 点「完成」只是关闭弹窗。真正的新增/更新发生在 /oauth/callback。
   if (!$('#create-step-2').classList.contains('hidden')) {
-    return doExchange();
+    closeCreate();
+    loadAll();
+    return;
   }
   goStep(2);
 }
@@ -1435,6 +1439,10 @@ function submitCreate() {
 // 不再用 window.open('about:blank') 占位——那会让新标签页长时间空白。
 // 改为让标签页直接打开真实的 /oauth/begin 页面（本地响应极快），
 // 该页自己负责清会话 + 跳转授权页。
+//
+// 2026-10-26：授权改成**自动回调**。用户登录完成后，上游跳回
+// /oauth/callback，后端直接换 token 入库，再 postMessage 通知主页面。
+// 用户不需要复制任何东西，标签页被关掉也不影响。
 function startAuth() {
   const name = $('#f-name').value.trim();
   let url = '/oauth/begin?name=' + encodeURIComponent(name);
@@ -1446,15 +1454,32 @@ function startAuth() {
     return;
   }
   $('#auth-status').textContent =
-    '已打开登录页。登录后复制页面上的授权码，粘到下面。';
-  // 清掉旧的 state，兑换时由后端按最近一次 manual 会话兜底
+    '已打开登录页。登录完成后会自动完成授权，这个页面会自动刷新账号列表。';
   oauthState = '';
+
+  // 自动模式没有可粘贴的"授权码页"，所以给一条兜底路径：
+  // 15 秒后如果还没收到 postMessage，把手动入口露出来。
+  //
+  // 为什么需要兜底：沙箱/代理环境里 postMessage 有可能到不了主窗口
+  // （跨域、弹窗被重定向成新标签页等）。这时用户至少还能自己把
+  // 回调 URL 粘进来完成授权，而不是完全卡死。
+  setTimeout(() => {
+    const box = $('#manual-exchange');
+    if (box && box.classList.contains('hidden') && !authDone) {
+      box.classList.remove('hidden');
+      $('#auth-status').textContent =
+        '还没收到授权结果。如果登录页已经跳转过了，可以把地址栏里的 URL 粘到下面手动完成。';
+    }
+  }, 15000);
 }
+
+// 授权是否已完成（收到 postMessage 后置 true，避免兜底提示干扰）
+let authDone = false;
 
 async function doExchange() {
   const code = $('#f-code').value.trim();
   if (!code) {
-    $('#create-err').textContent = '请先粘贴授权码';
+    $('#create-err').textContent = '请把登录后的完整地址粘进来';
     return;
   }
   const btn = $('#btn-next');
@@ -1533,11 +1558,25 @@ async function delAcc(id, name) {
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
   if (d.type !== 'oauth-result') return;
+
+  // 标记完成，让 startAuth 里那个 15 秒兜底提示不要再弹出来
+  authDone = true;
+
   if (d.ok) {
     toast(d.message || '账号已添加', 'ok');
+    // 自动模式下用户不用点「完成」，所以直接把弹窗收掉
+    const modal = $('#create-modal');
+    if (modal && !modal.classList.contains('hidden')) {
+      closeCreate();
+    }
     loadAll();
   } else {
     toast(d.message || '授权失败', 'err');
+    // 失败时把手动入口露出来，让用户能补救
+    const box = $('#manual-exchange');
+    if (box) box.classList.remove('hidden');
+    const st = $('#auth-status');
+    if (st) st.textContent = '授权没有成功：' + (d.message || '未知原因');
   }
 });
 

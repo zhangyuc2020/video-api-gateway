@@ -191,7 +191,7 @@ async def oauth_exchange(body: ExchangeBody, _: dict = Depends(require_admin)):
             # 所以只在**只有一个候选**时才兜底；多于一个就要求用户
             # 明确重来，而不是猜一个大概率错的。
             cand = [(k, v) for k, v in _PENDING.items()
-                    if v.get("manual") and time.time() - v["created"] < 900]
+                    if time.time() - v["created"] < 900]
             if not cand:
                 raise HTTPException(400, "授权会话已过期，请重新点击授权")
             if len(cand) > 1:
@@ -208,8 +208,16 @@ async def oauth_exchange(body: ExchangeBody, _: dict = Depends(require_admin)):
             _PENDING.pop(used_state, None)
 
     try:
+        # manual 标记跟着 pending 走（2026-10-26 改）。
+        #
+        # 以前这里硬编码 manual=True，但授权入口已经改成自动回调
+        # （pending["manual"] = False）。硬编码会让兑换时去取
+        # /oauth/manual-callback 那个 client 的 client_id，
+        # 而 code 是用 /oauth/callback 的 client 签发的 ——
+        # 兑换必然失败（invalid_grant）。
         bundle = await oauth.exchange_code(
-            code, pending["verifier"], manual=True,
+            code, pending["verifier"],
+            manual=bool(pending.get("manual")),
             slot=str(pending.get("slot") or ""),
         )
     except oauth.AuthError as e:
@@ -303,7 +311,27 @@ async def oauth_begin(name: str = "", relogin: int = 0,
         slot = secrets.token_hex(8)
 
     try:
-        url, verifier = await oauth.build_authorize_url(manual=True, slot=slot)
+        # ---- 2026-10-26：改回自动回调 ----
+        #
+        # 为什么放弃 manual（手动复制授权码）：
+        #   客户实测「重新登录 -> 登录成功 -> 标签页自己关掉 -> 看不到授权码」，
+        #   修了 slot 抖动之后**仍然复现**。而 manual 的整条链路依赖一个前提：
+        #   浏览器要能停在我们的 /oauth/manual-callback 页面上。
+        #   在 WorkBuddy 沙箱里这个前提不成立 —— 上游回跳的目标是网关写入的
+        #   内部域名，经过两层代理后标签页生命周期不受我们控制。
+        #
+        # 自动回调没有这个问题：**用户授权完成后我们直接换 token 入库**，
+        # 页面只是最后给个"成功/失败"的提示，它是不是被关掉都无所谓。
+        #
+        # 当初选 manual 的理由是"绕开静默 SSO 复用"（accounts.picsart.com
+        # 已有会话时会跳过登录页，直接复用原账号）。但这个顾虑现在不成立：
+        # build_authorize_url 默认带 prompt=login / max_age=0 /
+        # login_mode=standalone，三件套就是强制重新认证用的。
+        #
+        # 代价：多账号场景下，如果浏览器里还留着别的 Picsart 会话，
+        # 有可能被静默复用成同一个账号。缓解办法是授权前先清一次会话
+        # （oauth_begin 页面里的那个 iframe 就是在做这件事）。
+        url, verifier = await oauth.build_authorize_url(manual=False, slot=slot)
     except oauth.AuthError as e:
         # 这一页是用户**新开标签页**打开的，出错时如果走全局 500，
         # 他会看到一个纯黑页面 + 一行 JSON（`{"error":""}`），完全无从下手。
@@ -327,7 +355,9 @@ async def oauth_begin(name: str = "", relogin: int = 0,
         _PENDING[state] = {
             "verifier": verifier,
             "name": name.strip(),
-            "manual": True,
+            # manual=False：走 /oauth/callback 自动入库（2026-10-26 改）。
+            # 这个标记只影响兑换时用哪个 redirect_uri 对应的 client。
+            "manual": False,
             "relogin": int(relogin or 0),
             # slot 必须跟着 state 走：兑换时要用**同一个 client**，
             # 否则拿到的 refresh_token 会被绑到一个这里取不到的 client_id 上。
