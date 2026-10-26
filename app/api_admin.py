@@ -42,6 +42,104 @@ router = APIRouter()
 _PENDING: dict[str, dict[str, Any]] = {}
 _PENDING_LOCK = threading.Lock()
 
+# ---------------------------------------------------------------- 授权结果表
+#
+# 为什么需要它（2026-10-26，这是 OAuth 弹窗通信的最终解法）
+# ---------------------------------------------------------
+# 弹窗模式下把结果送回主窗口，原本只靠 `window.opener.postMessage`。
+# 但这条路在上游设了 COOP 头时**必然失效**，而且是静默失效：
+#
+#   Cross-Origin-Opener-Policy: same-origin
+#     -> 浏览器把弹窗放进独立浏览上下文组
+#     -> window.opener 被**永久置为 null**（回到自己域名也不恢复）
+#     -> postMessage 不发、不报错，主页面永远等下去
+#
+# 这不是我们的 bug，是浏览器安全策略。Microsoft 官方答复明确说
+# "cannot be overridden by your application"：
+#   https://docs.microsoft.com/en-us/answers/questions/5790872/
+#
+# 所以业界标准做法是**服务端中转**：回调页把结果写进服务端的一个槽位，
+# 主窗口轮询读取。窗口关系完全不参与，COOP 对它没有影响。
+# 参考实现（venm-auth）就是 "postMessage 快速路径 + 轮询兜底" 双通道。
+#
+# 结构：state -> {"ok": bool, "message": str, "at": float}
+#   写入：/oauth/callback 兑换完成后
+#   读取：GET /api/accounts/oauth/result?state=xxx
+#   清理：读走即删（一次性的），另有 TTL 兜底防泄漏
+_AUTH_RESULTS: dict[str, dict[str, Any]] = {}
+_AUTH_RESULTS_LOCK = threading.Lock()
+_AUTH_RESULT_TTL = 600.0        # 10 分钟够用户走完授权
+
+# 回调失败时（缺 code / 被拒绝）上游不给 state，用这个键存结果。
+# 前端轮询时不带 state，取"最近一次"，所以能读到。
+_NO_STATE_KEY = "_no_state_"
+
+
+def _put_auth_result(state: str, ok: bool, message: str) -> None:
+    """回调页写入授权结果，等主窗口来取。
+
+    ⚠️ state 为空**也要写**（2026-10-26 修）。
+    第一版是 `if not state: return`，结果「回调缺少 code」「授权被拒绝」
+    这两种失败完全静默 —— 而那恰恰是用户最需要看到反馈的情况：
+    他登录完了，弹窗关了，主页面却一直显示"还没收到授权结果"。
+
+    state 为空时用 `_take_latest_auth_result`（取最近一次）那条路取走，
+    所以不进字典键也能被读到。这里用一个特殊键存"无 state 的结果"。
+    """
+    now = time.time()
+    key = state or _NO_STATE_KEY
+    with _AUTH_RESULTS_LOCK:
+        _AUTH_RESULTS[key] = {"ok": bool(ok), "message": str(message), "at": now}
+        # 顺手清过期的（同一把锁内做）
+        for k in [k for k, v in _AUTH_RESULTS.items()
+                  if now - v["at"] > _AUTH_RESULT_TTL]:
+            _AUTH_RESULTS.pop(k, None)
+
+
+def _take_auth_result(state: str) -> dict[str, Any] | None:
+    """主窗口按 state 取结果。**取走即删** —— 一次性，避免下次误判。
+
+    查不到指定 state 时**回落到"无 state"的那条**：回调失败时
+    （缺 code / 被拒绝）上游根本没给 state，我们只能存到一个特殊键里。
+    那种结果同样要能被读到，否则用户看不到失败原因。
+    """
+    if not state:
+        return None
+    with _AUTH_RESULTS_LOCK:
+        got = _AUTH_RESULTS.pop(state, None)
+        if got is None:
+            got = _AUTH_RESULTS.pop(_NO_STATE_KEY, None)
+    if got and time.time() - got["at"] > _AUTH_RESULT_TTL:
+        return None
+    return got
+
+
+def _take_latest_auth_result() -> dict[str, Any] | None:
+    """取最近一次授权结果（不带 state 时用）。
+
+    为什么允许"不带 state 轮询"：
+      前端是通过 `window.open('/oauth/begin')` 打开授权的，而 state 是
+      后端在那个页面里生成的，**前端拿不到**（拿到的只是 HTML）。
+      要么改成两段式（先请求拿 state 再打开），要么让后端记住"最近一次"。
+
+      后者更简单，而且在**这个产品的使用场景里是安全的**：
+        · 单用户自托管，通常只有一个人在用
+        · 结果是一次性取走的，取走即删
+        · TTL 10 分钟，过期自动清
+      真正多人共用一个实例时，可能出现"张三看到李四的结果" ——
+      但那种部署本身就该启用管理密码（那时登录态已经隔离了人）。
+    """
+    now = time.time()
+    with _AUTH_RESULTS_LOCK:
+        live = [(k, v) for k, v in _AUTH_RESULTS.items()
+                if now - v["at"] <= _AUTH_RESULT_TTL]
+        if not live:
+            return None
+        # 取最新的那个
+        k, v = max(live, key=lambda kv: kv[1]["at"])
+        _AUTH_RESULTS.pop(k, None)
+    return v
+
 
 # ---------------------------------------------------------------- 登录
 
@@ -152,6 +250,40 @@ async def oauth_start(name: str = "", manual: bool = False,
             _PENDING.pop(k, None)
     return {"url": url.replace("&redirect_uri=", f"&state={state}&redirect_uri="),
             "state": state, "manual": manual}
+
+
+@router.get("/api/accounts/oauth/result")
+async def oauth_result(state: str = "", _: dict = Depends(require_admin)):
+    """轮询授权结果（2026-10-26 加）。
+
+    这是**自动回调模式下唯一可靠的完成信号**。
+
+    为什么不能只靠 postMessage：
+      上游授权页会发 `Cross-Origin-Opener-Policy: same-origin`，浏览器
+      因此把弹窗放进独立浏览上下文组，`window.opener` 被永久置为 null。
+      于是 `window.opener.postMessage(...)` 静默失效 —— 不抛错、不返回，
+      主窗口永远等不到通知。这是浏览器安全策略，应用改不了
+      （Microsoft 官方明确说明 "cannot be overridden"）。
+
+    所以改成：回调页把结果写进服务端（`_put_auth_result`），
+    主窗口每 2 秒问一次这里。窗口关系完全不参与，COOP 对它没影响。
+
+    返回：
+      {"status": "pending"}                         还没好，继续轮询
+      {"status": "ok",      "message": "..."}       成功（取走即删）
+      {"status": "error",   "message": "..."}       失败（取走即删）
+
+    `state` 可选。不传时取最近一次结果 —— 因为前端是通过
+    `window.open('/oauth/begin')` 打开授权的，拿不到后端生成的 state。
+    单用户自托管场景下这样是安全的，理由见 `_take_latest_auth_result`。
+    """
+    got = _take_auth_result(state) if state else _take_latest_auth_result()
+    if not got:
+        return {"status": "pending"}
+    return {
+        "status": "ok" if got.get("ok") else "error",
+        "message": got.get("message") or "",
+    }
 
 
 @router.post("/api/accounts/oauth/exchange")
@@ -549,11 +681,12 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         pending = _PENDING.pop(state, None) if state else None
 
     if error:
-        return _callback_page(False, f"授权被拒绝：{error}")
+        return _callback_page(False, f"授权被拒绝：{error}", state=state)
     if not code:
-        return _callback_page(False, "回调缺少 code 参数")
+        return _callback_page(False, "回调缺少 code 参数", state=state)
     if not pending:
-        return _callback_page(False, "授权状态已过期，请回到管理页重新发起")
+        return _callback_page(False, "授权状态已过期，请回到管理页重新发起",
+                              state=state)
 
     try:
         bundle = await oauth.exchange_code(
@@ -561,7 +694,7 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
             slot=str(pending.get("slot") or ""),
         )
     except oauth.AuthError as e:
-        return _callback_page(False, f"换取 token 失败：{e}")
+        return _callback_page(False, f"换取 token 失败：{e}", state=state)
 
     access = bundle["access_token"]
 
@@ -633,7 +766,7 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         msg = f"账号 {name} 已更新（同一 Picsart 账号，未重复添加）"
     else:
         msg = f"账号 {name} 已添加"
-    return _callback_page(True, msg, extra)
+    return _callback_page(True, msg, extra, state=state)
 
 
 def _auth_fail_page(err: "oauth.AuthError") -> str:
@@ -713,7 +846,15 @@ def _js_json(obj: Any) -> str:
     )
 
 
-def _callback_page(ok: bool, message: str, detail: str = "") -> HTMLResponse:
+def _callback_page(ok: bool, message: str, detail: str = "",
+                   state: str = "") -> HTMLResponse:
+    # 写进服务端结果表，供主窗口轮询取走（2026-10-26）。
+    #
+    # 位置选在这里而不是各个 return 点，是因为这个函数是**所有**授权结局的
+    # 唯一出口（成功/拒绝/缺 code/过期/兑换失败）。放在调用方就得改 5 处，
+    # 漏一处就会出现"某种失败主窗口收不到"，而这种漏最难发现。
+    _put_auth_result(state, ok, message)
+
     color = "#31d0aa" if ok else "#ff5c5c"
     icon = "✓" if ok else "✕"
     payload = _js_json({"type": "oauth-result", "ok": ok, "message": message})
@@ -750,21 +891,54 @@ def _callback_page(ok: bool, message: str, detail: str = "") -> HTMLResponse:
   </div>
 <script>
   const PAYLOAD = {payload};
-  function finish() {{
+  // ---- 把结果送回主窗口（2026-10-26 修）----
+  //
+  // 原来只靠 `window.opener.postMessage`。这在沙箱里**不成立**：
+  // 授权链路是 /oauth/begin -> location.replace(上游授权页) -> 回跳到本页，
+  // 而上游授权页自己还会做几次重定向。任何一跳把 opener 置空
+  // （跨域跳转、被重定向成新标签页等），opener 就永久是 null，
+  // postMessage 发不出去 —— 用户看到的就是"登录完了但主页面毫无反应"，
+  // 15 秒后兜底输入框弹出来。
+  //
+  // 所以三条道并行发，任意一条通就行：
+  //   1. window.opener.postMessage   传统方式，同标签页时最快
+  //   2. BroadcastChannel            同源标签页广播，不依赖 opener
+  //   3. localStorage + storage 事件  最老的兼容手段，前两个都失败时才用
+  //
+  // 只能发，不能知道哪条到了 —— 重复由前端去重（authDone 标记）。
+  // 宁可多发，不可漏发：漏发的后果是用户盯着永不刷新的页面。
+  function broadcast() {{
     try {{
       if (window.opener && !window.opener.closed) {{
         window.opener.postMessage(PAYLOAD, '*');
       }}
     }} catch (e) {{}}
+
+    try {{
+      const bc = new BroadcastChannel('picsart-pool-oauth');
+      bc.postMessage(PAYLOAD);
+      bc.close();
+    }} catch (e) {{}}
+
+    try {{
+      // storage 事件不会在**本页**触发，正好用来通知别的标签页
+      localStorage.setItem('oauth-result', JSON.stringify(
+        Object.assign({{}}, PAYLOAD, {{_t: Date.now()}})
+      ));
+      // 3 秒后清掉，避免下次打开管理页时误判成"刚授权成功"
+      setTimeout(function () {{
+        try {{ localStorage.removeItem('oauth-result'); }} catch (e) {{}}
+      }}, 3000);
+    }} catch (e) {{}}
+  }}
+
+  function finish() {{
+    broadcast();
     window.close();
     setTimeout(() => {{ document.querySelector('.msg').textContent =
       '可以手动关闭此标签页，并回到管理页刷新'; }}, 300);
   }}
-  try {{
-    if (window.opener && !window.opener.closed) {{
-      window.opener.postMessage(PAYLOAD, '*');
-    }}
-  }} catch (e) {{}}
+  broadcast();
   // 成功时自动关闭，失败留给用户看原因
   if ({str(ok).lower()}) setTimeout(finish, 1200);
 </script>

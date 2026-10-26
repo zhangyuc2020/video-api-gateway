@@ -1457,12 +1457,15 @@ function startAuth() {
     '已打开登录页。登录完成后会自动完成授权，这个页面会自动刷新账号列表。';
   oauthState = '';
 
-  // 自动模式没有可粘贴的"授权码页"，所以给一条兜底路径：
-  // 15 秒后如果还没收到 postMessage，把手动入口露出来。
+  // 重置状态并启动服务端轮询（这是唯一不受 COOP 影响的通知通道）
+  authDone = false;
+  startAuthPolling();
+
+  // 兜底：25 秒还没结果就把手动入口露出来。
   //
-  // 为什么需要兜底：沙箱/代理环境里 postMessage 有可能到不了主窗口
-  // （跨域、弹窗被重定向成新标签页等）。这时用户至少还能自己把
-  // 回调 URL 粘进来完成授权，而不是完全卡死。
+  // 为什么是 25 秒：轮询每 2 秒一次，正常授权（登录 + 回跳 + 换 token）
+  // 通常 5~15 秒。25 秒还没动静基本说明卡住了。
+  // 注意这里**不停轮询** —— 用户手动粘贴后可能成功，但轮询也可能先到。
   setTimeout(() => {
     const box = $('#manual-exchange');
     if (box && box.classList.contains('hidden') && !authDone) {
@@ -1470,11 +1473,12 @@ function startAuth() {
       $('#auth-status').textContent =
         '还没收到授权结果。如果登录页已经跳转过了，可以把地址栏里的 URL 粘到下面手动完成。';
     }
-  }, 15000);
+  }, 25000);
 }
 
-// 授权是否已完成（收到 postMessage 后置 true，避免兜底提示干扰）
-let authDone = false;
+// authDone 的声明在文件底部（OAuth 回跳提示那一节）。
+// 它要在 startAuth 的 15 秒兜底里被读，所以用 `let` 声明在模块作用域
+// 都能访问 —— 但**只能声明一次**，重复声明会 SyntaxError。
 
 async function doExchange() {
   const code = $('#f-code').value.trim();
@@ -1553,18 +1557,42 @@ async function delAcc(id, name) {
 }
 
 // ---------------------------------------------------------------- OAuth 回跳提示
+//
+// **三条道 + 服务端轮询**（2026-10-26，按业界标准做法改）
+//
+// 背景：上游授权页会发 `Cross-Origin-Opener-Policy: same-origin`，
+// 浏览器因此把弹窗放进独立浏览上下文组，`window.opener` 被**永久置 null**，
+// `postMessage` 静默失效 —— 不报错、不返回，主窗口永远等不到。
+// 这是浏览器安全策略，应用无法覆盖（Microsoft 官方答复原话）。
+//
+// 所以真正可靠的是**服务端中转**：回调页把结果写进服务端，
+// 主窗口轮询取。窗口关系完全不参与，COOP 对它没有影响。
+//
+// 现在四条道并行，任意一条到就算成功：
+//   1. 服务端轮询（主力，唯一不受 COOP 影响的）
+//   2. window.opener.postMessage（快，但常失效）
+//   3. BroadcastChannel（同源广播）
+//   4. localStorage storage 事件（最老的兼容）
+//
+// 用一个标记去重，处理逻辑只跑一次。
 
-// 授权弹窗会 postMessage 结果过来，收到就刷新列表
-window.addEventListener('message', (ev) => {
-  const d = ev.data || {};
-  if (d.type !== 'oauth-result') return;
+let authDone = false;
+let _authPollTimer = null;
 
-  // 标记完成，让 startAuth 里那个 15 秒兜底提示不要再弹出来
+function onOauthResult(d) {
+  if (!d || d.type !== 'oauth-result') return;
+  if (authDone) return;          // 多条道都会发，只处理第一次
   authDone = true;
+
+  // 停掉轮询和兜底计时器
+  if (_authPollTimer) {
+    clearInterval(_authPollTimer);
+    _authPollTimer = null;
+  }
 
   if (d.ok) {
     toast(d.message || '账号已添加', 'ok');
-    // 自动模式下用户不用点「完成」，所以直接把弹窗收掉
+    // 自动模式下用户不用点「完成」，直接把弹窗收掉
     const modal = $('#create-modal');
     if (modal && !modal.classList.contains('hidden')) {
       closeCreate();
@@ -1577,6 +1605,68 @@ window.addEventListener('message', (ev) => {
     if (box) box.classList.remove('hidden');
     const st = $('#auth-status');
     if (st) st.textContent = '授权没有成功：' + (d.message || '未知原因');
+  }
+}
+
+// 把轮询结果转成 onOauthResult 需要的形状
+function _fromPoll(d) {
+  if (!d || d.status === 'pending') return;
+  onOauthResult({
+    type: 'oauth-result',
+    ok: d.status === 'ok',
+    message: d.message || '',
+  });
+}
+
+// 道 1（主力）：轮询服务端
+//
+// 每 2 秒一次，最多 5 分钟。为什么要停：用户可能再也不回来，
+// 无限轮询会给服务器加无意义的负载。
+function startAuthPolling() {
+  if (_authPollTimer) clearInterval(_authPollTimer);
+  const started = Date.now();
+  const LIMIT = 5 * 60 * 1000;
+
+  _authPollTimer = setInterval(async () => {
+    if (authDone || Date.now() - started > LIMIT) {
+      clearInterval(_authPollTimer);
+      _authPollTimer = null;
+      return;
+    }
+    try {
+      const r = await fetch('/api/accounts/oauth/result', {
+        headers: { 'accept': 'application/json' },
+        credentials: 'same-origin',
+      });
+      if (!r.ok) return;               // 401（登录过期）等：静默跳过
+      _fromPoll(await r.json());
+    } catch (e) {
+      // 网络抖动：下一轮再试，不打断
+    }
+  }, 2000);
+}
+
+// 道 2：postMessage
+window.addEventListener('message', (ev) => {
+  onOauthResult(ev.data);
+});
+
+// 道 3：BroadcastChannel
+try {
+  const _bc = new BroadcastChannel('picsart-pool-oauth');
+  _bc.addEventListener('message', (ev) => onOauthResult(ev.data));
+} catch (e) {
+  // 老浏览器没有 BroadcastChannel —— 还有另外几条道
+}
+
+// 道 4：localStorage 的 storage 事件
+// 注意：storage 事件只在**其他**标签页触发，同页写不会触发 —— 正好。
+window.addEventListener('storage', (ev) => {
+  if (ev.key !== 'oauth-result' || !ev.newValue) return;
+  try {
+    onOauthResult(JSON.parse(ev.newValue));
+  } catch (e) {
+    /* 不是我们的数据，忽略 */
   }
 });
 
