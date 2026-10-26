@@ -206,8 +206,18 @@ async def me(request: Request):
 
 @router.get("/api/accounts/oauth/start")
 async def oauth_start(name: str = "", manual: bool = False,
+                      relogin: int = 0,
                       _: dict = Depends(require_admin)):
     """生成官方授权 URL。
+
+    ⚠️ `relogin` 参数曾经缺失（2026-10-26 修）。
+    这个函数体里的"沿用原账号 client_slot"那段是从 `oauth_begin` 整段
+    复制过来的，但签名没跟着加参数 —— 于是只要有人调这个路由就直接
+    `NameError: name 'relogin' is not defined`，返回 500。
+
+    影响面有限（前端走的是 `/oauth/begin`，这个属遗留路由），
+    但留着就是个必然炸的接口，而且错误信息会被全局 handler 包成
+    `{"error":"name 'relogin' is not defined"}` 吐给调用方 —— 很难看。
 
     manual=True 时走"粘贴授权码"模式（参照 sub2api）：
       回调页只把 code 显示出来，由用户复制回表单。
@@ -243,6 +253,9 @@ async def oauth_start(name: str = "", manual: bool = False,
             "verifier": verifier,
             "name": name.strip(),
             "manual": manual,
+            # 也存 relogin：兑换/入库时要知道这条授权是"覆盖某个账号"
+            # 还是"新增"（2026-10-26 补齐，和 oauth_begin 保持一致）
+            "relogin": int(relogin or 0),
             "slot": slot,
             "created": time.time(),
         }
