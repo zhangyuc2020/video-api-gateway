@@ -552,6 +552,11 @@ async def fetch_tier(account: dict[str, Any]) -> str:
 
     返回值：'pro' / 'free' / 空串（查不到）。
     查不到时**不猜**，交给 package_id_for() 走"不发送该头"的分支。
+
+    ⚠️ `granted=False`（订阅失效）也归为 'free' —— 这是有意的：
+      没有有效订阅就是 free 档，两者在"能不能跑 wan3"这件事上没区别。
+      不要试图拆成 'expired' 之类的细分值：那个区分来自推测，
+      上游并没有这样定义，拆出来只会让判断逻辑变复杂而无收益。
     """
     uid = str(account.get("sub") or "").strip()
     if not uid:
@@ -571,7 +576,7 @@ async def fetch_tier(account: dict[str, Any]) -> str:
     sub = body.get("subscription") or {}
     if not isinstance(sub, dict):
         return ""
-    # granted=false 表示订阅已失效，此时按 free 处理
+    # granted=False（订阅失效）等同于 free：没有有效订阅就享受不到 pro 权限。
     if sub.get("granted") is False:
         return "free"
     return str(sub.get("tier_id") or "").strip().lower()

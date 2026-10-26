@@ -187,7 +187,16 @@ async def upload_file(request: Request,
 @router.get("/v1/credits")
 async def credits(authorization: str | None = Header(default=None)):
     _guard(authorization)
-    accounts = [a for a in store.list_accounts() if a["status"] == "ok"]
+    # ⚠️ 必须和 /api/stats 同口径（2026-10-26 修）。
+    #
+    # 原来这里写 `if a["status"] == "ok"`，没排除 free 档 ——
+    # 于是同一个实例上出现两个矛盾的数字：
+    #   /api/stats   -> accounts_ok = 0   （已排除 free）
+    #   /v1/credits  -> accounts_ok = 1   （没排除）
+    # 调用方拿 credits 判断"有没有号可用"，会误以为能干活。
+    #
+    # 现在统一走 store.usable_accounts()：凭证 + status=ok + 非 free。
+    accounts = store.usable_accounts()
     return {
         "accounts_ok": len(accounts),
         "credits_total": sum(a["credits"] or 0 for a in accounts),
@@ -198,6 +207,15 @@ async def credits(authorization: str | None = Header(default=None)):
             {"credits": a["credits"], "tier": a["tier_credits"]}
             for a in accounts
         ],
+        # free 档且状态健康的号数：帮调用方区分"没有号"和"号没权限"。
+        # 不加这个字段的话，调用方看到 accounts_ok=0 而库里明明有号，
+        # 会以为是统计坏了。
+        "accounts_free": len([
+            a for a in store.list_accounts()
+            if a.get("status") == "ok"
+            and (a.get("access_token") or a.get("cookie"))
+            and store.tier_blocked(a)
+        ]),
     }
 
 
