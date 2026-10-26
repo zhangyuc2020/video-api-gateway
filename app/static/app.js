@@ -43,8 +43,39 @@ function toast(msg, kind = '', ms = 3800) {
   el._t = setTimeout(() => el.classList.add('hidden'), ms);
 }
 
+// 给 URL 补上 sharecode（分享模式下网关会拦掉没带它的请求）
+//
+// 为什么需要这个助手（2026-10-26，这是"登录完了主页面没反应"的真正根因）：
+//
+// WorkBuddy 部署出来的实例走分享链接模式，网关把关：
+//     GET /api/accounts/oauth/result                -> 403（被网关拦，不到应用）
+//     GET /api/accounts/oauth/result?sharecode=xxx  -> 200
+//
+// 而前端所有 fetch 都是裸路径。于是：
+//   · OAuth 结果轮询每次 403 -> 代码里 `if (!r.ok) return` 静默跳过
+//     -> 表现和 postMessage 失效一模一样，主页面永远等不到结果
+//   · /api/docs 下载文档、/v1/files 上传素材同理，全都成了摆设
+//
+// 之前几个版本换着法子改通知机制（postMessage / BroadcastChannel /
+// storage / 服务端轮询）都没用 —— **因为请求根本没到应用**。
+//
+// 做法：把当前页面的 search 原样保留，已带 sharecode 就不重复加。
+// 非分享模式（自托管）时 search 为空，这个函数等于直接返回原 path。
+function withShare(path) {
+  try {
+    const qs = location.search || '';
+    if (!qs) return path;
+    // 已经自带 query 的，用 & 连接
+    const sep = path.includes('?') ? '&' : '?';
+    // 去掉开头的 ?
+    return path + sep + qs.replace(/^\?/, '');
+  } catch (e) {
+    return path;
+  }
+}
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
+  const res = await fetch(withShare(path), {
     credentials: 'same-origin',
     headers: { 'content-type': 'application/json' },
     ...opts,
@@ -170,7 +201,7 @@ async function doActivate(ev) {
   showActivateError('');
 
   try {
-    const r = await fetch('/api/license/activate', {
+    const r = await fetch(withShare('/api/license/activate'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ card }),
@@ -812,7 +843,7 @@ function copyUploadCurl() {
 async function fetchDocs(download) {
   // 用 fetch 而不是直接 window.open：需要拿到正文才能判断成功/失败，
   // 也才能做"复制"。直接 open 一个失败响应只会给用户一个空白标签页。
-  const res = await fetch('/api/docs' + (download ? '?download=1' : ''), {
+  const res = await fetch(withShare('/api/docs' + (download ? '?download=1' : '')), {
     credentials: 'same-origin',
   });
   if (!res.ok) {
@@ -1051,7 +1082,7 @@ async function pgUploadTo(fileInput) {
   try {
     const fd = new FormData();
     fd.append('file', file, file.name);
-    const r = await fetch('/v1/files', {
+    const r = await fetch(withShare('/v1/files'), {
       method: 'POST',
       // ⚠️ 不要设 content-type：浏览器要自己加 multipart 的 boundary。
       // 手动设了反而会丢 boundary，服务端解析失败。
@@ -1627,6 +1658,20 @@ function startAuthPolling() {
   const started = Date.now();
   const LIMIT = 5 * 60 * 1000;
 
+  // ⚠️ 必须带上 sharecode（2026-10-26 修的**第二个**根因）。
+  //
+  // WorkBuddy 部署的分享链接模式下，网关会拦所有不带 sharecode 的请求：
+  //     GET /api/accounts/oauth/result                -> 403
+  //     GET /api/accounts/oauth/result?sharecode=xxx  -> 200
+  //
+  // 而第一版的 fetch 是 `fetch('/api/accounts/oauth/result')` ——
+  // 每次轮询都被网关 403，代码里又是 `if (!r.ok) return;` 静默跳过，
+  // 所以表现和"postMessage 失效"一模一样：主页面永远等不到结果。
+  //
+  // 这就是为什么换了几种通知机制都没用 —— 请求根本没到应用。
+  // 用当前页面的 search 原样带过去，不管是不是分享模式都正确。
+  const qs = location.search || '';
+
   _authPollTimer = setInterval(async () => {
     if (authDone || Date.now() - started > LIMIT) {
       clearInterval(_authPollTimer);
@@ -1634,7 +1679,8 @@ function startAuthPolling() {
       return;
     }
     try {
-      const r = await fetch('/api/accounts/oauth/result', {
+      // 用 withShare 统一处理 sharecode，不再手动拼 qs
+      const r = await fetch(withShare('/api/accounts/oauth/result'), {
         headers: { 'accept': 'application/json' },
         credentials: 'same-origin',
       });
@@ -1703,7 +1749,7 @@ const UPDATE_HIDE_KEY = 'pool.update.hidden';
 async function checkUpdate() {
   let d;
   try {
-    const r = await fetch('/__version', { cache: 'no-store' });
+    const r = await fetch(withShare('/__version'), { cache: 'no-store' });
     if (!r.ok) return;
     d = await r.json();
   } catch {
