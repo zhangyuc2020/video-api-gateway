@@ -701,10 +701,28 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         return _callback_page(False, "授权状态已过期，请回到管理页重新发起",
                               state=state)
 
+    # 本次授权用的 client 槽位。pending 里存着，落库时要用。
+    #
+    # ⚠️ 2026-10-26 修（这是「登录完主页面没反应」最致命的一环）：
+    # 下面 `exchange_code(..., slot=...)` 只是**关键字参数**，它不会在
+    # 本函数里创建同名局部变量。而写库那段有 `"client_slot": slot` ——
+    # 于是回调一走到 upsert_account 就抛
+    #     NameError: name 'slot' is not defined
+    # 整个回调 500，账号永远加不上，前端轮询永远 pending。
+    #
+    # 这块代码是从 oauth_begin 复制过来的：那边 `slot` 是函数顶部的
+    # 局部变量，这边没有，复制时没跟着改。
+    #
+    # 为什么查了很久：回调页在这种失败下**渲染不出来**（500 在返回
+    # HTML 之前就抛了），所以浏览器看到的是白页/被关，而不是错误提示。
+    # 我们一直在查「通知机制」（postMessage / COOP / sharecode），
+    # 而真正的问题是结果压根没被处理。
+    slot = str(pending.get("slot") or "")
+
     try:
         bundle = await oauth.exchange_code(
             code, pending["verifier"],
-            slot=str(pending.get("slot") or ""),
+            slot=slot,
         )
     except oauth.AuthError as e:
         return _callback_page(False, f"换取 token 失败：{e}", state=state)

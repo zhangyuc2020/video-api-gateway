@@ -624,7 +624,14 @@ async def _resume_task(t: dict[str, Any]) -> None:
                 finished_at=time.time(),
             )
             return
-        result = await pool.pool().resume(acct, upstream_id, on_progress=_progress)
+        # ⚠️ 2026-10-26 修：原来写 `on_progress=_progress`，而 `_progress`
+        # 在 `_resume_task` 这个函数里从来没有定义过 —— 走到这条续跟分支
+        # 必抛 NameError，整个恢复直接失败。
+        #
+        # `resume()` 的 on_progress 本来就有默认值 None，不传即可正常跑。
+        # 想让进度可见的话该在这里**定义**一个回调转发给任务记录，
+        # 但那是功能增强，不是修 bug，先把"必然抛错"去掉。
+        result = await pool.pool().resume(acct, upstream_id)
         now = time.time()
         if result is None:
             # 账号正被别的任务占着 —— 不判死，标回 queued 让它在下次启动/手动重试时再来
@@ -986,7 +993,15 @@ async def _on_failure(tid: str, exc: Exception) -> None:
         tid, status="in_progress",
         error=f"本地连接中断（{type(exc).__name__}），正在从上游恢复",
     )
-    await _follow_upstream(tid, acct, up_id, on_progress=_progress)
+    # ⚠️ 2026-10-26 修（和 `_resume_task` 里那处是同一个 bug 的第二个入口）：
+    # 原来写 `on_progress=_progress`，而 `_on_failure` 里根本没有这个变量
+    # —— 走到这条"断线恢复"分支必抛 NameError，恢复直接失败。
+    #
+    # 这个入口比 `_resume_task` 更常被踩到：任何一次本地连接中断
+    # （用户断网、代理掉线、客户端超时）都会走到这里，然后恢复崩掉。
+    # 表现出来是"任务卡在 in_progress 再也不动"，而任务本身在上游
+    # 其实还在跑 —— 很难联想到是 NameError。
+    await _follow_upstream(tid, acct, up_id)
 
 
 async def _follow_upstream(

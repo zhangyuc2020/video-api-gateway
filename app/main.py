@@ -159,12 +159,30 @@ async def index():
 
 @app.get("/app.js")
 async def app_js():
-    return FileResponse(STATIC / "app.js", media_type="application/javascript")
+    # 加 Cache-Control（2026-10-26，排查时被缓存绕了一圈）。
+    #
+    # 注意：正常入口是首页 —— `/` 会把 app.js **内联**进 HTML（见上面
+    # 的 css/js 替换），所以绝大多数用户拿到的 JS 是随首页一起下发的，
+    # 更新后必然生效。这个独立路由只是兜底（有人直接访问 /app.js）。
+    #
+    # 但它原本只有 Etag + Last-Modified，没有 Cache-Control，
+    # 浏览器会走启发式缓存（可能几小时不重新请求）。排查"前端到底有没有
+    # 新代码"时这是个真实的干扰源：线上文件是新的，浏览器跑的是旧的。
+    # no-cache = 每次都要回源验证（Etag 没变则 304，开销可忽略）。
+    return FileResponse(
+        STATIC / "app.js",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/style.css")
 async def style_css():
-    return FileResponse(STATIC / "style.css", media_type="text/css")
+    return FileResponse(
+        STATIC / "style.css",
+        media_type="text/css",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.exception_handler(Exception)

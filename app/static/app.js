@@ -1474,16 +1474,44 @@ function submitCreate() {
 // 2026-10-26：授权改成**自动回调**。用户登录完成后，上游跳回
 // /oauth/callback，后端直接换 token 入库，再 postMessage 通知主页面。
 // 用户不需要复制任何东西，标签页被关掉也不影响。
+//
+// ⚠️ 2026-10-26 第二次修：**不能用 window.open 开授权页**。
+//
+// 真实故障：客户登录完 Picsart，标签页**自己关了**，主页面 25 秒后弹
+// "还没收到授权结果"。查下来不是通知机制的问题 —— 服务端结果表里
+// 什么都没有，说明回调页从没被渲染过：
+//   · 我们只在**成功**时自动关窗（`_callback_page` 里 `if ok: finish()`），
+//     而成功分支在关窗前一定会先 upsert_account(status="ok") 写库。
+//   · 库里那条账号始终是 dead / fails=3，说明成功页从没渲染过。
+//   · 所以关窗的不是我们，是**上游授权页**在登录成功后直接 close()。
+//
+// 为什么它能关：`window.open()` 开出来的是「脚本打开的窗口」，
+// 规范允许脚本关掉自己开的窗口（"Scripts may close only the windows
+// that were opened by them"）。于是 code 还没回跳，标签页就没了。
+//
+// 这个坑从 manual 时代就存在，一直被误判成 slot / redirect_uri /
+// postMessage 的问题，所以换了几版通知机制都没用。
+//
+// 修法：改成**真实 <a target="_blank"> 点击**打开。用户点击打开的标签页，
+// 浏览器会忽略页面对 window.close() 的调用，标签页就能活到回跳那一步。
+// rel=noopener 让上游彻底拿不到 opener —— 反正 COOP 已经把 opener 断了，
+// 通知只走服务端轮询。
 function startAuth() {
   const name = $('#f-name').value.trim();
   let url = '/oauth/begin?name=' + encodeURIComponent(name);
   if (reloginId) url += '&relogin=' + reloginId;
-  const w = window.open(url, '_blank');
-  if (!w) {
-    $('#auth-status').textContent = '弹窗被拦截，请允许本站弹窗后再试';
-    toast('弹窗被拦截，请允许本站弹窗', 'err');
-    return;
-  }
+
+  // 用 <a> 而不是 window.open。必须在本函数（= 用户点击的事件处理里）
+  // 同步触发，否则会被弹窗拦截。
+  const a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
   $('#auth-status').textContent =
     '已打开登录页。登录完成后会自动完成授权，这个页面会自动刷新账号列表。';
   oauthState = '';
