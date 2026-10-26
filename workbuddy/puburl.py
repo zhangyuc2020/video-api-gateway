@@ -85,16 +85,59 @@ def install_public_url(app: FastAPI) -> None:
                 _override.reset(token)
 
     @app.get("/__domain")
-    async def _domain():
+    async def _domain(request: Request):
         """发布后自检用：确认应用真的看到了公网域名。
 
         不带授权门的刻意的 —— 它只回几个地址，不含任何号池信息，
         却能在"打开白屏/加号失败"时一眼区分「服务没起来」和「URL 算错了」。
+
+        ---- 2026-10-26 加 headers ----
+
+        客户实例出现过一个真实故障：`public_url` 被推导成
+        `3000-xxx.sandbox.cloudstudio.club`（沙箱内部地址），
+        而用户浏览器访问的是 `xxx.apps.workbuddy.host`（公网域名）。
+        于是 OAuth 的 redirect_uri 指向一个**用户浏览器到不了**的地址 ——
+        上游回跳时页面直接失败，表现为"标签页自动关闭、看不到授权码"。
+
+        光看 public_url 分不清是"网关给错了"还是"我们算错了"。
+        所以把中间件实际看到的那几个头原样回报出来，一眼可判：
+          · 如果 x-forwarded-host 就是内部地址 -> 网关的问题，我们得换来源
+          · 如果它是对的公网域名 -> 是我们 _pick() 的逻辑有问题
+          · 如果 origin / referer 带着公网域名 -> 可以用它们兜底
         """
         from app.config import settings
+
+        # 只回报与地址推导相关的那几个头，不回报 cookie / authorization
+        watched = (
+            "host",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-for",
+            "x-real-ip",
+            "origin",
+            "referer",
+            "x-forwarded-server",
+            "forwarded",
+        )
+        seen = {}
+        for k in watched:
+            v = request.headers.get(k)
+            if v:
+                # referer 可能很长，只留 scheme://host
+                if k in ("origin", "referer"):
+                    try:
+                        from urllib.parse import urlparse
+
+                        p = urlparse(v)
+                        v = f"{p.scheme}://{p.netloc}" if p.netloc else v[:80]
+                    except Exception:
+                        v = v[:80]
+                seen[k] = v
 
         return {
             "public_url": settings.public_url,
             "redirect_uri": settings.redirect_uri,
             "from_env": bool(settings._env_public_url),
+            # 中间件实际看到的头（2026-10-26 加，用于诊断地址推导）
+            "headers": seen,
         }

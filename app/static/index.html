@@ -465,8 +465,32 @@
       <p class="hint" style="margin:0">
         Base URL：<code id="usage-base"></code> ·
         鉴权：<code>Authorization: Bearer &lt;API_KEY&gt;</code> ·
-        Content-Type：<code>application/json</code>
+        Content-Type：<code>application/json</code>（带文件时用 <code>multipart/form-data</code>）
       </p>
+
+      <!-- 带本地文件怎么调。
+           这一块单独放，因为它是**日常最容易卡住的一步**：
+           以前素材必须是公网链接，客户得先找图床。
+           现在可以直接 -F 传文件，但很多人不知道有这条路径。 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>带本地文件（图生视频）</h2>
+          <button class="ghost small" onclick="copyUploadCurl()">复制</button>
+        </div>
+        <p class="hint" style="margin:0 0 10px">
+          把文件直接放进请求，用 <code>multipart/form-data</code>。
+          服务器会传到上游、拿到公网链接、填进 <code>image_urls</code> 再提交 ——
+          <b>不需要你先上传</b>。
+        </p>
+        <pre id="upload-demo"></pre>
+        <p class="hint" style="margin:10px 0 0">
+          字段名：<code>image</code> / <code>video</code> / <code>audios</code> /
+          <code>start_frame</code> / <code>end_frame</code>。
+          同名传多次会自动累积成多张。<br>
+          ⚠️ <code>audio</code>（不带 s）是布尔（输出要不要音轨），参考音频写 <code>audios</code>。<br>
+          同一素材要复用于多个任务时，可以先 <code>POST /v1/files</code> 拿链接再用。
+        </p>
+      </div>
 
       <!-- 下载接口文档（Markdown）
            用户通常是把这份文档直接丢给 AI（Claude/ChatGPT/Cursor）让它写调用代码。
@@ -523,6 +547,11 @@
               <td><code>GET /v1/credits</code></td>
               <td>号池可用账号数</td>
               <td><code>200</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /v1/files</code></td>
+              <td>上传素材，拿公网链接（<code>multipart</code>）</td>
+              <td><code>200</code> 带 <code>url</code></td>
             </tr>
           </tbody>
         </table>

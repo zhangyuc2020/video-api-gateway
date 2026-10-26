@@ -684,6 +684,9 @@ async function loadHealth() {
 function buildCurl() {
   const origin = location.origin;
   if ($('#usage-base')) $('#usage-base').textContent = origin;
+  // 带文件的示例单独一块（见 renderUploadDemo）—— 它和文生视频
+  // 的调用形状差别大（multipart vs JSON），混在一个代码块里会难读。
+  renderUploadDemo(origin);
   $('#curl-demo').textContent =
 `# 1) 文生视频（默认异步，立即返回 task id）
 curl -X POST ${origin}/v1/videos/generations \\
@@ -754,6 +757,44 @@ function buildMediaDemo() {
 
 function copyCurl() {
   navigator.clipboard.writeText($('#curl-demo').textContent)
+    .then(() => toast('已复制', 'ok'))
+    .catch(() => toast('复制失败', 'err'));
+}
+
+// 带本地文件的调用示例。
+//
+// 用 -F 而不是 JSON + base64：文件原样流式转发，不膨胀、
+// 不会把整个文件读进内存。这一点对 20MB 的视频参考差别很大。
+function renderUploadDemo(origin) {
+  const el = $('#upload-demo');
+  if (!el) return;
+  el.textContent =
+`# 图生视频：图片随请求带上（一步完成）
+curl -X POST ${origin}/v1/videos/generations \\
+  -H "authorization: Bearer YOUR_KEY" \\
+  -F "prompt=让它动起来" \\
+  -F "image=@photo.jpg" \\
+  -F "resolution=720P" \\
+  -F "duration=5"
+
+# 多个素材：同名传多次即可
+  -F "image=@a.jpg" -F "image=@b.jpg"
+# prompt 里写 图1 / 图2，或给 -F "image=@a.jpg;..." 配名字（用 JSON 时更直观）
+
+# 首尾帧
+  -F "start_frame=@first.jpg" -F "end_frame=@last.jpg"
+
+# 只想先拿链接（同一素材复用多次时）
+curl -X POST ${origin}/v1/files \\
+  -H "authorization: Bearer YOUR_KEY" \\
+  -F "file=@photo.jpg"
+# 返回 {"url": "https://..."}，把它填进 image_urls / video_urls / audio_urls`;
+}
+
+function copyUploadCurl() {
+  const t = $('#upload-demo')?.textContent || '';
+  if (!t) { toast('示例还没渲染出来', 'err'); return; }
+  navigator.clipboard.writeText(t)
     .then(() => toast('已复制', 'ok'))
     .catch(() => toast('复制失败', 'err'));
 }
@@ -967,10 +1008,81 @@ function pgAddMedia(type = 'image', url = '', name = '') {
       </select>
       <button class="pg-c-del" title="移除" onclick="this.closest('.pg-card').remove()">✕</button>
     </div>
-    <input class="pg-c-url" placeholder="https://..." value="${esc(url)}" spellcheck="false">
-    <input class="pg-c-name" placeholder="名字（可选，prompt 里 @名字 引用）" value="${esc(name)}">`;
+    <input class="pg-c-url" placeholder="https://...  或点下面的「上传文件」" value="${esc(url)}" spellcheck="false">
+    <input class="pg-c-name" placeholder="名字（可选，prompt 里 @名字 引用）" value="${esc(name)}">
+    <div class="pg-c-up">
+      <input type="file" class="pg-c-file" hidden onchange="pgUploadTo(this)">
+      <button class="ghost mini pg-c-upbtn"
+              onclick="this.parentNode.querySelector('.pg-c-file').click()">上传文件</button>
+      <span class="pg-c-upmsg"></span>
+    </div>`;
   $('#pg-media-list').appendChild(card);
   return card;
+}
+
+// 上传一个文件到 /v1/files，把返回的 url 填进本卡输入框。
+//
+// 为什么调用测试页要支持（2026-10-26）：
+//   以前只能粘公网链接 —— 想在图生视频里用一张本地图片，
+//   得先去别处传一遍拿链接。而 /v1/files 正是为了消除这一步。
+//   调用测试页如果不能传文件，"测试"和"真实用法"就对不上。
+async function pgUploadTo(fileInput) {
+  const card = fileInput.closest('.pg-card');
+  if (!card) return;
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+
+  const urlIn = card.querySelector('.pg-c-url');
+  const msg = card.querySelector('.pg-c-upmsg');
+  const btn = card.querySelector('.pg-c-upbtn');
+
+  // 前端只做友好提示。真正的上限在服务端（配置项），
+  // 改配置后这里不需要同步改。
+  if (file.size > 20 * 1024 * 1024) {
+    msg.textContent = `太大（${(file.size / 1048576).toFixed(1)} MB，上限 20 MB）`;
+    msg.className = 'pg-c-upmsg err';
+    return;
+  }
+
+  btn.disabled = true;
+  msg.className = 'pg-c-upmsg';
+  msg.textContent = `上传中… ${(file.size / 1024).toFixed(0)} KB`;
+
+  try {
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    const r = await fetch('/v1/files', {
+      method: 'POST',
+      // ⚠️ 不要设 content-type：浏览器要自己加 multipart 的 boundary。
+      // 手动设了反而会丢 boundary，服务端解析失败。
+      headers: pgAuthOnly(),
+      body: fd,
+    });
+    const txt = await r.text();
+    let d = {};
+    try { d = JSON.parse(txt); } catch { /* 非 JSON 响应 */ }
+    if (!r.ok) {
+      throw new Error(d.detail || d.error || txt.slice(0, 120) || ('HTTP ' + r.status));
+    }
+    if (!d.url) throw new Error('返回里没有 url');
+    urlIn.value = d.url;
+    msg.textContent = '已上传，链接已填入';
+    msg.className = 'pg-c-upmsg ok';
+  } catch (e) {
+    msg.textContent = '失败：' + (e.message || e);
+    msg.className = 'pg-c-upmsg err';
+  } finally {
+    btn.disabled = false;
+    fileInput.value = '';      // 允许重选同一个文件（重试）
+  }
+}
+
+// 只要 Authorization，不设 content-type（见上面 boundary 的说明）
+function pgAuthOnly() {
+  const h = {};
+  const key = ($('#pg-key-on').checked ? $('#pg-key').value || '' : '').trim();
+  if (key) h.authorization = 'Bearer ' + key;
+  return h;
 }
 
 // ---------- 发送 ----------

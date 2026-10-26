@@ -125,12 +125,17 @@ async def oauth_start(name: str = "", manual: bool = False,
     #   · 重新登录（relogin>0）-> 沿用原账号的 slot，保持 client 不变
     #     （refresh_token 绑定 client，换了就刷新失败）
     #   · 新增 -> 随机生成，写进 _PENDING，账号落库时一并保存
+    #
+    # ⚠️ 老账号没有 client_slot 时**不要现生成**（2026-10-26 修）。
+    # 每次点「重新登录」都注册一个新 client 会让上游攒一堆，
+    # 回跳可能匹配到旧的 /oauth/callback（那个页面会自动关窗）。
+    # 详见下面 oauth_begin 里同一条修复的完整说明。
     slot = ""
     if relogin:
         _row = store.get_account(int(relogin))
         if _row:
             slot = str(_row.get("client_slot") or "")
-    if not slot:
+    else:
         slot = secrets.token_hex(8)
 
     url, verifier = await oauth.build_authorize_url(manual=manual, slot=slot)
@@ -273,12 +278,28 @@ async def oauth_begin(name: str = "", relogin: int = 0,
     #
     # ⚠️ 重新登录必须**沿用原 client_slot**：refresh_token 绑定签发它的
     # client_id，换了 slot 就等于换了 client，刷新时必然 invalid_grant。
+    #
+    # ⚠️⚠️ 老账号（v2026.10.30 之前加的）**没有 client_slot**，此时
+    # **绝不能现生成一个**（2026-10-26 修，客户实测故障）：
+    #
+    #   1. 每点一次「重新登录」就生成新 slot -> 注册一个新 client
+    #   2. 新 client 的 redirect_uri 是 `.../manual-callback?slot=<新值>`
+    #   3. 上游那边攒了一堆 client，回跳时可能匹配到**旧的**
+    #      `/oauth/callback`（自动模式）
+    #   4. 那个页面 `if ok: setTimeout(finish, 1200)` -> `window.close()`
+    #   5. 用户看到的现象：登录成功后标签页自己关了，**根本看不到授权码**
+    #
+    # 所以：没有 slot 就保持空，用共享 client。共享 client 的
+    # redirect_uri 是干净的 `/oauth/manual-callback`，能正常显示授权码页。
+    # 等这次重新登录成功、账号落库后，client_slot 会被写进去，
+    # 之后就有稳定的 slot 可沿用了。
     slot = ""
+    _need_new_slot = not relogin      # 只有全新账号才需要新 slot
     if relogin:
         _row = store.get_account(int(relogin))
         if _row:
             slot = str(_row.get("client_slot") or "")
-    if not slot:
+    if _need_new_slot:
         slot = secrets.token_hex(8)
 
     try:
@@ -891,144 +912,6 @@ def _find_by_sub(sub: str) -> dict[str, Any] | None:
         if a.get("sub") == sub:
             return a
     return None
-
-
-# ---------------------------------------------------------------- 账号管理
-
-class TokenBody(BaseModel):
-    name: str = ""
-    notes: str = ""
-    access_token: str = ""
-    refresh_token: str = ""
-    device_id: str = ""
-    package_id: str = ""
-
-
-@router.post("/api/accounts/token")
-async def add_by_token(body: TokenBody, _: dict = Depends(require_admin)):
-    """导入现成 access_token（从浏览器 Network 里复制 Bearer）。"""
-    tok = (body.access_token or "").strip()
-    if tok.startswith("Bearer "):
-        tok = tok[7:].strip()
-    if not tok:
-        raise HTTPException(400, "access_token 为空")
-
-    device_id = body.device_id.strip() or oauth.new_device_id()
-    try:
-        ident = await oauth.fetch_identity(tok, device_id, strict=True)
-    except oauth.AuthError as e:
-        raise HTTPException(400, f"token 校验失败：{e}")
-    name = _unique_name(body.name.strip() or ident.get("username") or "token")
-
-    aid = store.upsert_account({
-        "name": name,
-        "kind": "oauth" if body.refresh_token else "cookie",
-        "access_token": tok,
-        "refresh_token": body.refresh_token.strip(),
-        # 带 refresh_token 才有"用哪个 client 刷新"的问题。
-        # 从 access_token 的 claim 解出来 —— 那是签发方写的，天然正确；
-        # 留空的话 refresh 时会回退去"全库最新一条 client"，必然对不上。
-        "client_id": oauth.client_id_from_token(tok) if body.refresh_token else "",
-        "device_id": device_id,
-        "sub": ident.get("sub", ""),
-        "username": ident.get("username", ""),
-        "email": ident.get("email", ""),
-        "tier": ident.get("tier", ""),
-        "photo": ident.get("photo", ""),
-        "package_id": body.package_id.strip(),
-        "expires_at": oauth.token_expiry({"access_token": tok}),
-        "status": "ok",
-        "cooldown_until": 0,
-        "fails": 0,
-        "last_error": "",
-    })
-    try:
-        await pool.pool().refresh_account_info(aid)
-    except Exception:
-        pass
-    return {"ok": True, "id": aid, "name": name}
-
-
-class CookieBody(BaseModel):
-    name: str = ""
-    notes: str = ""
-    cookie: str = ""
-
-
-@router.post("/api/accounts/cookie")
-async def add_by_cookie(body: CookieBody, _: dict = Depends(require_admin)):
-    """用浏览器 Cookie 登录。
-
-    两条路：
-      1) cookie 里带 access_token -> 直接当 token 用
-      2) 只有会话 cookie -> 带 cookie 调 me.json 验证，能过就存起来
-         （后续请求直接用 cookie 头，靠会话自身续命）
-    """
-    raw = (body.cookie or "").strip()
-    if not raw:
-        raise HTTPException(400, "cookie 为空")
-
-    bearer = oauth.cookie_to_bearer(raw)
-    if bearer:
-        # 探测和入库必须用同一个 device_id，否则 Picsart 侧看到的是两个设备。
-        #
-        # 但如果这个 token 对应的 Picsart 账号**已经在库里**，就沿用它的
-        # device_id —— 否则指纹会变（fingerprint.py 用 device_id 做种子），
-        # 而且上游会多出一条设备记录。同一个坑在 _store_oauth_account
-        # 里也踩过一次，这里是同一处修复的第二个入口。
-        _dev = ""
-        try:
-            _pre = oauth.parse_jwt(bearer)
-            _sub = str(_pre.get("sub") or "")
-            _row = _find_by_sub(_sub) if _sub else None
-            if _row:
-                _dev = str(_row.get("device_id") or "")
-        except Exception:
-            pass
-        device_id = _dev or oauth.new_device_id()
-        try:
-            ident = await oauth.fetch_identity(bearer, device_id, strict=True)
-        except oauth.AuthError as e:
-            raise HTTPException(400, f"Cookie 中的 token 无效：{e}")
-        name = _unique_name(body.name.strip() or ident.get("username") or "cookie")
-        aid = store.upsert_account({
-            "name": name, "kind": "oauth", "access_token": bearer,
-            "device_id": device_id, "sub": ident.get("sub", ""),
-            "username": ident.get("username", ""), "email": ident.get("email", ""),
-            "expires_at": oauth.token_expiry({"access_token": bearer}),
-            "status": "ok", "cooldown_until": 0, "fails": 0, "last_error": "",
-        })
-        try:
-            await pool.pool().refresh_account_info(aid)
-        except Exception:
-            pass
-        return {"ok": True, "id": aid, "name": name, "mode": "cookie→bearer"}
-
-    try:
-        ident = await oauth.login_from_cookie(raw)
-    except oauth.AuthError as e:
-        raise HTTPException(400, str(e))
-
-    name = _unique_name(body.name.strip() or ident.get("username") or "cookie")
-    aid = store.upsert_account({
-        "name": name,
-        "kind": "cookie",
-        "access_token": "",
-        "refresh_token": "",
-        "cookie": raw,
-        "device_id": ident["device_id"],
-        "sub": ident.get("sub", ""),
-        "username": ident.get("username", ""),
-        "email": ident.get("email", ""),
-        "tier": ident.get("tier", ""),
-        "photo": ident.get("photo", ""),
-        "expires_at": time.time() + 86400 * 30,   # cookie 会话未知，给个宽期限
-        "status": "ok",
-        "cooldown_until": 0,
-        "fails": 0,
-        "last_error": "",
-    })
-    return {"ok": True, "id": aid, "name": name, "mode": "cookie"}
 
 
 @router.post("/api/accounts/{aid}/reset")
