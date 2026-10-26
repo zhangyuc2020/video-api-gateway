@@ -431,13 +431,26 @@ async function loadTasks() {
 
   // 顶部统计：一眼看出堵在哪
   const n = (s) => ts.filter((t) => t.status === s).length;
+
+  // 「并发能力」= 真实可用账号数（2026-10-26 修）。
+  //
+  // 原来用 `data.capacity || 1`，两个问题叠加：
+  //   1. 后端 capacity = max(1, 有凭证账号数)，**不看 status**
+  //      -> 账号全 dead 时也显示 2
+  //   2. 前端的 `|| 1` 又会把 0 变成 1
+  // 结果就是客户看到的「可用账号 0/2」+「并发能力 2」自相矛盾。
+  //
+  // 后端现在额外给 `live`（未钳制的真实可用数），展示用它；
+  // `capacity` 仍参与"还要等几轮"的除法，所以保留并兜底兼容旧后端。
+  const liveCap = data.live ?? data.capacity ?? 0;
+
   $('#task-stats').innerHTML = `
     <div class="stat ok"><div class="n">${n('in_progress')}</div><div class="l">生成中</div></div>
     <div class="stat ${n('queued') ? 'warn' : ''}"><div class="n">${n('queued')}</div><div class="l">排队中</div></div>
     <div class="stat ok"><div class="n">${n('completed')}</div><div class="l">完成</div></div>
     <div class="stat ${n('failed') ? 'bad' : ''}"><div class="n">${n('failed')}</div><div class="l">失败</div></div>
     <div class="stat ${n('unknown') ? 'warn' : ''}"><div class="n">${n('unknown')}</div><div class="l">状态未知</div></div>
-    <div class="stat"><div class="n">${data.capacity || 1}</div><div class="l">并发能力</div></div>
+    <div class="stat ${liveCap ? '' : 'bad'}"><div class="n">${liveCap}</div><div class="l">并发能力</div></div>
   `;
 
   const tb = $('#task-table tbody');

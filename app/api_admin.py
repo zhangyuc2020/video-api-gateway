@@ -1358,13 +1358,26 @@ async def tasks(limit: int = 50, _: dict = Depends(require_admin)):
     queued.sort(key=lambda t: t["created_at"])
     pos = {t["id"]: i + 1 for i, t in enumerate(queued)}
 
-    # 池子里同时能干几个（= 有凭证的账号数），用来判断"还要等几轮"
+    # 池子里同时能干几个（= **可用**账号数），用来判断"还要等几轮"
+    #
+    # ⚠️ 2026-10-26 修：原来只判断"有凭证"，不看状态。
+    # 后果：账号全部失效（status=dead）时，页面显示
+    #   「可用账号 0/2」+「并发能力 2」
+    # 两个数字自相矛盾 —— 一个号都跑不了，却声称能并行 2 个。
+    # 客户截图里正是这个现象。
+    #
+    # 正确的口径应该和号池实际调度一致：pool 里 `_credential_dead()`
+    # 明确把 status=dead 排除在外，所以这里也必须要求 status="ok"。
     try:
         accts = [a for a in store.list_accounts()
-                 if a.get("access_token") or a.get("cookie")]
-        capacity = max(1, len(accts))
+                 if (a.get("access_token") or a.get("cookie"))
+                 and a.get("status") == "ok"]
+        live = len(accts)
     except Exception:
-        capacity = 1
+        live = 0
+    # capacity 用于算轮次（rounds = ceil(pos/capacity)），不能为 0。
+    # 但**展示**要用 live：0 个可用账号时写"并发能力 0"才是实话。
+    capacity = max(1, live)
 
     now = time.time()
     out = []
@@ -1409,7 +1422,10 @@ async def tasks(limit: int = 50, _: dict = Depends(require_admin)):
         d["schedule_s"] = seg("started", "upstream")   # 上游调度
         d["gen_s"] = seg("upstream", "finished")       # 真实生成
         out.append(d)
-    return {"tasks": out, "capacity": capacity, "queued": len(queued)}
+    # `live` 是**真实可用账号数**，专供展示；`capacity` 是给轮次计算用的
+    # （已钳到 ≥1，避免除零）。两者分开，前端才能诚实地显示"并发能力 0"。
+    return {"tasks": out, "capacity": capacity, "live": live,
+            "queued": len(queued)}
 
 
 def _task_summary(t: dict[str, Any]) -> str:
