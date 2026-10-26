@@ -171,6 +171,21 @@ def apply(mod, cfg: dict[str, Any]) -> None:
     mod.STATUS_VALUES = rules.get("status_values") or {}
     mod.FEATURE_ID_FORMAT = rules.get("feature_id_format", "")
     mod.DRIVE_OPTIONS = rules.get("drive_options") or {}
+    # 应用级令牌（2026-10-26）。原本只从环境变量读，
+    # 但素材上传要用它，而客户不会自己配环境变量 —— 随配置下发。
+    # 实测：不带它上传也能成功（说明上游没强制），带上更贴近网页端。
+    if not mod.APP_AUTHORIZATION:
+        mod.APP_AUTHORIZATION = str(hdr.get("app_authorization") or "")
+    # ---- 素材上传（2026-10-26 加）----
+    # 端点来自 endpoints.upload / endpoints.upload_path，
+    # 字段名与上限来自 rules.upload_*。
+    # 全部随配置一起下发，客户端源码里没有字面量。
+    mod.UPLOAD_BASE = str(eps.get("upload") or "").rstrip("/")
+    mod.UPLOAD_PATH = str(eps.get("upload_path") or "")
+    mod.UPLOAD_TYPE = str(rules.get("upload_type") or "")
+    mod.UPLOAD_FILE_FIELD = str(rules.get("upload_file_field") or "file")
+    mod.UPLOAD_TYPE_FIELD = str(rules.get("upload_type_field") or "type")
+    mod.UPLOAD_MAX_BYTES = int(rules.get("upload_max_bytes") or 0)
     mod.SUCCESS_CODES = tuple(rules.get("success_codes") or (200, 201, 202))
     mod.DEFAULTS = rules.get("defaults") or {}
 
@@ -265,7 +280,8 @@ _INJECTED_NAMES = (
     "FEATURES", "ME", "USER_SHOW", "PENDING_USES", "WAN3_WORKFLOW",
     "MODELS_WORKFLOW", "TOUCHPOINT", "TOUCHPOINT_REFERRER",
     "PACKAGE_ID_BY_TIER", "UA", "BROWSER_HEADERS", "STATIC_HEADERS",
-    "DRIVE_HEADERS", "H_ACCEPT", "H_DEVICE", "H_PACKAGE", "H_TOUCH",
+    "DRIVE_HEADERS", "APP_AUTHORIZATION",
+    "H_ACCEPT", "H_DEVICE", "H_PACKAGE", "H_TOUCH",
     "H_TOUCH_REF", "H_UA", "H_APP_AUTH", "H_AUTH", "AUTH_PREFIX", "H_COOKIE",
     "FREE_RESOLUTIONS", "PAID_RESOLUTIONS", "ALL_RESOLUTIONS", "RATIOS",
     "DURATION_MIN", "DURATION_MAX", "DURATION_AUTO", "DURATIONS",
@@ -274,6 +290,11 @@ _INJECTED_NAMES = (
     "WORKFLOW_KIND", "MEDIA_KINDS", "PRIME_SUFFIX", "MODEL_ALIASES",
     "MODEL_SLUG", "STATUS_VALUES", "FEATURE_ID_FORMAT", "DRIVE_OPTIONS",
     "MESSAGES", "SUCCESS_CODES", "FRAME_EXCLUSIVE", "DEFAULTS", "DEFAULT_SCOPE",
+    # 素材上传（2026-10-26）。必须在这里，否则「运行时激活 / 热更新」
+    # 之后 app.upload 拿到的还是空串 —— 表现是上传报 not_configured，
+    # 而 app.config 里明明有值（这就是 propagate 与 apply 的区别）。
+    "UPLOAD_BASE", "UPLOAD_PATH", "UPLOAD_TYPE",
+    "UPLOAD_FILE_FIELD", "UPLOAD_TYPE_FIELD", "UPLOAD_MAX_BYTES",
 )
 
 

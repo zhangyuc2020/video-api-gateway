@@ -100,6 +100,26 @@ DURATION_WITH_VIDEO_REF: tuple[int, ...] = ()
 MEDIA_TYPES: tuple[str, ...] = ()
 MEDIA_MAX = 20
 MEDIA_LIMITS: dict[str, int] = {}
+
+# ---- 素材上传（2026-10-26 新增）----
+#
+# 背景：media[].url 必须是上游能抓取的公网地址。原来完全靠调用方自备，
+# 客户做图生视频得先自己找图床，很难用。
+#
+# 实测（2026-10-26，用网页端 HAR 里的头直接打）：
+#   POST <UPLOAD_BASE>/v2/files  multipart{file, type=editing-temp}
+#   -> {"status":"success","response":{"url":"https://gcdn.../<uuid>.png"}}
+#   0.35s，216 字节响应，**不需要用户 token**，只要应用令牌 + deviceid。
+#
+# 所以上传可以和号池完全解耦：不占用户授权额度、不碰 auth 端点。
+#
+# 端点与头全部来自配置 —— 和 login/media 一样，不在这里写字面量。
+UPLOAD_BASE = ""            # 如 https://upload.picsart.com
+UPLOAD_PATH = ""            # 如 /v2/files
+UPLOAD_TYPE = ""            # 表单里的 type 字段，如 editing-temp
+UPLOAD_FILE_FIELD = "file"  # 文件字段名
+UPLOAD_TYPE_FIELD = "type"  # type 字段名
+UPLOAD_MAX_BYTES = 0        # 单文件上限，0 = 不检查（由上游校验）
 FRAME_TYPES: tuple[str, ...] = ()
 REFERENCE_TYPES: tuple[str, ...] = ()
 REF_VIDEO_AUDIO_TOTAL_MAX = 15

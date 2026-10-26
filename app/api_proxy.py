@@ -73,6 +73,117 @@ async def models(authorization: str | None = Header(default=None)):
     }
 
 
+@router.post("/v1/files")
+async def upload_file(request: Request,
+                      authorization: str | None = Header(default=None)):
+    """上传素材，返回可直接放进 media[].url 的公网链接。
+
+    **推荐用这个，不要用 base64。**
+
+    为什么这是正确的方式（2026-10-26）
+    ----------------------------------
+    参考视频可能 20MB+。base64 会把体积膨胀 33%（27MB 字符串），
+    而解析 JSON 需要先把整个 body 读进内存 —— 峰值翻倍，
+    且首字节延迟等于收完整个文件的耗时。multipart 流式传输则：
+        · 不膨胀
+        · 边收边发，内存里只有一个 chunk
+        · 客户端可以同步看到上传进度
+
+    用法（curl）::
+
+        curl -X POST "https://你的域名/v1/files" \\
+          -H "authorization: Bearer YOUR_KEY" \\
+          -F "file=@photo.png"
+
+    返回::
+
+        {"url": "https://gcdn.picsart.com/editing-temp/<uuid>.png",
+         "download_url": "（同上）",
+         "name": "photo.png", "mime": "image/png", "size": 12345}
+
+    然后把 `url` 填进提交参数的素材字段::
+
+        {"prompt": "...", "image_urls": ["https://gcdn.../xxx.png"]}
+
+    也支持 `?field=image_urls` 那种"上传即提交"的写法？不支持 ——
+    上传和提交分开是刻意的：同一个素材可能被多个任务复用，
+    分开才能复用，也才能在提交失败时不重复上传。
+    """
+    _guard(authorization)
+
+    from . import upload as _upload
+
+    if not _upload.configured():
+        raise HTTPException(
+            503,
+            "素材上传未启用（服务端配置缺少 upload 端点）。"
+            "请改用公网可访问的素材链接。",
+        )
+
+    ctype = request.headers.get("content-type", "")
+    if "multipart/form-data" not in ctype:
+        raise HTTPException(
+            400,
+            "请用 multipart/form-data 上传（curl 里是 -F 参数）。"
+            "不接受 base64 内联：大文件会占用数倍内存。",
+        )
+
+    # 用 starlette 的流式表单解析：它把大文件落到临时文件，
+    # 不会整包进内存。这是不用 `await request.form()` 之外的理由 ——
+    # 两者内部其实一样，但这里显式取 UploadFile 以便流式读。
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(
+            400, f"无法解析上传表单（{type(e).__name__}）。"
+                 f"请确认用的是 multipart/form-data。"
+        ) from e
+
+    f = form.get("file")
+    if f is None:
+        raise HTTPException(400, '缺少 `file` 字段')
+
+    # UploadFile（有 read）或普通 bytes（极小文件时某些客户端会走这条）
+    filename = getattr(f, "filename", "") or ""
+    if hasattr(f, "read"):
+        async def chunks():
+            while True:
+                b = await f.read(64 * 1024)
+                if not b:
+                    break
+                yield b
+
+        size_hint = 0
+        # starlette 的 UploadFile 有 size（部分版本），没有就靠中途检查
+        size_hint = int(getattr(f, "size", 0) or 0)
+    else:
+        data = f if isinstance(f, bytes) else str(f).encode()
+
+        async def chunks():
+            yield data
+
+        size_hint = len(data)
+
+    try:
+        got = await _upload.upload_stream(chunks(), filename, size_hint)
+    except _upload.UploadError as e:
+        raise HTTPException(
+            413 if e.code == "too_large" else
+            503 if e.code == "not_configured" else
+            502 if e.code in ("timeout", "network", "unauthorized") else
+            400,
+            str(e),
+        ) from e
+    finally:
+        # 关掉临时文件句柄。不关的话大文件会一直占着 /tmp 直到 GC。
+        try:
+            await f.close()          # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    return got
+
+
 @router.get("/v1/credits")
 async def credits(authorization: str | None = Header(default=None)):
     _guard(authorization)
@@ -101,9 +212,58 @@ async def generate(
 
     默认 `wait: true` 同步返回（单任务约 5 分钟）。
     批量场景建议 `wait: false`，拿 id 去轮询，避免 HTTP 连接被长任务拖死。
+
+    ---- 两种请求格式都支持（2026-10-26 加）----
+
+    1) **application/json** —— 传统方式，素材用公网 URL 或内联 base64::
+
+        {"prompt": "...", "image_urls": ["https://..."]}
+
+    2) **multipart/form-data** —— **一步到位**，文件直接随提交带上::
+
+        curl -X POST .../v1/videos/generations \\
+          -H "authorization: Bearer KEY" \\
+          -F "prompt=让它动起来" \\
+          -F "image=@photo.jpg" \\
+          -F "resolution=720P" \\
+          -F "duration=5"
+
+       文件字段可以是 image / images / video / audio / start_frame / end_frame，
+       也可以直接叫 file（此时按类型猜）。其余字段一律当普通表单值处理，
+       和 JSON 的字段名完全一致。
+
+    为什么值得支持 multipart：客户传一张 5MB 的图，
+    用 base64 要编成 6.7MB 字符串、整包进内存；multipart 是原样流式转发，
+    一次调用就能提交，不用先上传拿链接再提交。
+    两种方式最终都走同一条「上传 -> 换公链 -> 提交」的路径。
     """
     _guard(authorization)
-    body = await request.json()
+
+    ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype == "multipart/form-data":
+        body = await _body_from_multipart(request)
+    else:
+        body = await request.json()
+
+    # 素材上传只走 multipart 入口（2026-10-26 决策）。
+    #
+    # 曾经支持过 JSON body 里内联 base64（data URL / 裸 base64），
+    # 现在删掉了，原因：
+    #
+    #   1. **没有独占场景**。能发 JSON 的客户端都能发 multipart，
+    #      而 multipart 不膨胀体积、流式转发、不整包进内存。
+    #      base64 的每一项都是劣势。
+    #   2. **两条写素材的路径 = 两套 bug**。内联转换和 multipart 转换
+    #      都要处理"哪些字段是素材、怎么归类、怎么防重名"，
+    #      逻辑重复就一定会漂移。
+    #   3. 客户实测：5MB 图编成 base64 是 6.7MB 字符串，
+    #      FastAPI 解析时内存峰值翻倍 —— 而 multipart 是同一条链路上
+    #      更省的方式。
+    #
+    # 现在素材只有三种来源，都在 multipart 或 URL 里，语义唯一：
+    #   · 表单文件   -> 我们上传换公链
+    #   · JSON 里的 http(s) URL -> 原样放行
+    #   · 其它       -> _build_params 的 validate_media 报错
 
     params = _build_params(body)
     # 视频任务实测 5 分钟左右，同步会一直占着连接；
@@ -266,6 +426,139 @@ def resume_tasks(rows: list[dict[str, Any]]) -> int:
         job.add_done_callback(_discard)
         n += 1
     return n
+
+
+# 表单字段名 -> 它们在 JSON 里的语义。
+#
+# 同一个语义支持多个别名，因为不同客户端的习惯不一样：
+#   curl -F "image=@a.png"        单数
+#   curl -F "images=@a.png"       复数
+#   curl -F "image_urls=@a.png"   照抄 JSON 字段名
+#   curl -F "file=@a.png"         最通用的叫法
+#
+# ⚠️ `audio` **不在**这里（2026-10-26 修）。
+# 它在 JSON body 里是**布尔**（输出要不要音轨），
+# 参考音频的字段是 `audio_urls` / `audio_url`。
+# 一开始把 audio 同时放进素材别名和布尔别名，会让
+# `-F "audio=@a.mp3"`（想传参考音频）被当成布尔 true ——
+# 文件丢了，还静默改变输出行为。这类"一个名字两种语义"的坑
+# 只能靠明确划清界限来避免。
+_MP_IMAGE_KEYS = ("image", "images", "image_urls", "reference_image", "file")
+_MP_VIDEO_KEYS = ("video", "videos", "video_urls", "reference_video")
+_MP_AUDIO_KEYS = ("audios", "audio_urls", "reference_audio")
+_MP_FRAME_KEYS = ("start_frame", "first_frame", "end_frame", "last_frame")
+
+# 这些 JSON 字段是数组/数字/布尔，表单里全是字符串，要转回来。
+#
+# `audio` 在这里是**布尔** —— 输出要不要音轨（对应 JSON 的 audio）。
+# `audio_out` 是同一件事的别名，避免有人以为它指的是参考音频。
+_MP_BOOL_KEYS = ("audio", "audio_out", "watermark", "enable_thinking",
+                 "prompt_extend", "wait")
+_MP_INT_KEYS = ("duration", "seed")
+_MP_JSON_KEYS = ("media",)          # 直接贴 JSON 数组
+
+
+async def _body_from_multipart(request: Request) -> dict[str, Any]:
+    """把 multipart 表单转成和 JSON 等价的 body dict。
+
+    设计原则：**转换后的 body 与 JSON 请求完全同构**。
+    这样后面 _build_params 一行都不用改 —— 两条入口归一到同一条
+    处理链路，不会出现"表单能跑但 JSON 不行"这种难查的差异。
+
+    文件字段：立刻上传换成公链，放进对应的数组字段。
+    标量字段：按名字做类型转换（表单值永远是字符串）。
+    """
+    from . import upload as _upload
+
+    form = await request.form()
+    body: dict[str, Any] = {}
+    files_uploaded: list[dict[str, Any]] = []
+
+    def add_media(key: str, url: str, name: str = "") -> None:
+        arr = body.setdefault(key, [])
+        if not isinstance(arr, list):
+            arr = []
+            body[key] = arr
+        arr.append({"url": url, "name": name} if name else url)
+
+    for key, value in form.multi_items():
+        # ---- 文件字段 ----
+        if hasattr(value, "read"):
+            filename = getattr(value, "filename", "") or "upload.bin"
+            size_hint = int(getattr(value, "size", 0) or 0)
+
+            async def chunks(v=value):
+                while True:
+                    b = await v.read(64 * 1024)
+                    if not b:
+                        break
+                    yield b
+
+            try:
+                got = await _upload.upload_stream(chunks(), filename, size_hint)
+            except _upload.UploadError as e:
+                raise HTTPException(
+                    413 if e.code == "too_large" else
+                    503 if e.code == "not_configured" else
+                    400,
+                    str(e),
+                ) from e
+            finally:
+                try:
+                    await value.close()
+                except Exception:
+                    pass
+
+            files_uploaded.append(got)
+            # 按字段名归类到对应的 JSON 字段
+            k = key.lower()
+            if k in ("start_frame", "first_frame"):
+                body["start_frame"] = got["url"]
+            elif k in ("end_frame", "last_frame"):
+                body["end_frame"] = got["url"]
+            elif k in _MP_AUDIO_KEYS:
+                add_media("audio_urls", got["url"])
+            elif k in _MP_VIDEO_KEYS:
+                add_media("video_urls", got["url"])
+            else:
+                # image / images / image_urls / file / 任何未知字段
+                add_media("image_urls", got["url"])
+            continue
+
+        # ---- 普通标量字段 ----
+        s = value if isinstance(value, str) else str(value)
+        k = key.lower()
+
+        if k in _MP_JSON_KEYS:
+            try:
+                body[key] = json.loads(s)
+            except Exception:
+                body[key] = s
+            continue
+
+        if k in _MP_BOOL_KEYS:
+            body[key] = s.strip().lower() in ("1", "true", "yes", "on")
+            continue
+
+        if k in _MP_INT_KEYS:
+            try:
+                body[key] = int(s)
+            except ValueError:
+                body[key] = s          # 让 _build_params 去判非法并报错
+            continue
+
+        # 数组型素材字段：表单里重复同名 key 会进 multi_items，
+        # 这里累积成列表而不是覆盖。
+        if k in ("image_urls", "video_urls", "audio_urls"):
+            add_media(k, s)
+            continue
+
+        body[key] = s
+
+    if files_uploaded:
+        log.info("multipart 提交：上传了 %d 个文件", len(files_uploaded))
+    return body
+
 
 
 async def _resume_task(t: dict[str, Any]) -> None:

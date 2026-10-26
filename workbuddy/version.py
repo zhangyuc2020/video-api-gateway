@@ -30,7 +30,7 @@ from typing import Any
 log = logging.getLogger("picsart-pool.version")
 
 # 每次打 Release 时改这里
-__version__ = "2026.10.31"
+__version__ = "2026.11.01"
 
 # 版本检查的目标。允许用环境变量覆盖（自托管/内网镜像）。
 # 更新源：GitHub Releases（2026-10-25 从自建分发站改回）
