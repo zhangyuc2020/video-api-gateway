@@ -550,3 +550,8 @@ button.ghost.attention:hover{background:rgba(255,92,92,.12)}
   .pg-c-up{flex-wrap:wrap}
   .pg-c-upmsg{flex:1 1 100%}
 }
+
+/* ---------- free 档账号：能登录但不能跑 wan3 ----------
+   状态健康却不可用，必须一眼看出来，否则用户会以为号坏了。 */
+.tier-badge.tier-free{background:rgba(255,92,92,.16);color:#ff8f8f;
+  border-color:rgba(255,92,92,.4)}

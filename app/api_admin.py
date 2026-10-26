@@ -1360,19 +1360,14 @@ async def tasks(limit: int = 50, _: dict = Depends(require_admin)):
 
     # 池子里同时能干几个（= **可用**账号数），用来判断"还要等几轮"
     #
-    # ⚠️ 2026-10-26 修：原来只判断"有凭证"，不看状态。
-    # 后果：账号全部失效（status=dead）时，页面显示
-    #   「可用账号 0/2」+「并发能力 2」
-    # 两个数字自相矛盾 —— 一个号都跑不了，却声称能并行 2 个。
-    # 客户截图里正是这个现象。
+    # ⚠️ 2026-10-26 两处修正，都用 store.account_usable() 统一口径：
+    #   1. 原来只看"有凭证"，不看 status —— 账号全 dead 时页面显示
+    #      「可用账号 0/2」+「并发能力 2」，自相矛盾。
+    #   2. 后来发现 tier=free 的号也没有 wan3 权限，同样不该计入。
     #
-    # 正确的口径应该和号池实际调度一致：pool 里 `_credential_dead()`
-    # 明确把 status=dead 排除在外，所以这里也必须要求 status="ok"。
+    # 判定逻辑现在只有一份（store.account_usable），不会再漂。
     try:
-        accts = [a for a in store.list_accounts()
-                 if (a.get("access_token") or a.get("cookie"))
-                 and a.get("status") == "ok"]
-        live = len(accts)
+        live = len(store.usable_accounts())
     except Exception:
         live = 0
     # capacity 用于算轮次（rounds = ceil(pos/capacity)），不能为 0。

@@ -291,6 +291,60 @@ def list_accounts() -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------- 账号可用性
+#
+# 为什么需要这个（2026-10-26）
+# ----------------------------
+# 「这个号能不能跑 wan3」原本散在 6 个地方各写一遍，而且**都只看有没有
+# 凭证**，不看账号状态、也不看订阅档位。于是：
+#
+#   · status=dead 的失效号被算进"并发能力"
+#   · tier=free 的号被当成能用 —— 但 free 账号没有 wan3 权限，
+#     提交上去必然失败，等于浪费一次调度
+#
+# 现在收敛成一个函数，所有判断都调它，口径不可能再漂。
+
+# 明确**不能**跑 wan3 的档位。其余（含空串）都算可用。
+#
+# ⚠️ 空串必须算可用：`fetch_tier()` 查不到时返回 ""，而且新加的号
+# 在 refresh_account_info 跑完之前 tier 就是空的。如果空串算不可用，
+# 刚授权的号会立刻显示"不可用"，用户会以为授权失败。
+#
+# 也就是说：**只有明确知道它是 free 才排除**，不知道就放行
+# （让上游去拒绝，错误信息比我们自己猜更准确）。
+_BLOCKED_TIERS = ("free",)
+
+
+def tier_blocked(account: dict[str, Any]) -> bool:
+    """这个账号的订阅档位是否明确不支持 wan3。"""
+    tier = str(account.get("tier") or "").strip().lower()
+    return tier in _BLOCKED_TIERS
+
+
+def account_usable(account: dict[str, Any]) -> bool:
+    """这个账号现在能不能接任务。
+
+    三个条件全部满足才算可用：
+      1. 有凭证（access_token 或 cookie）
+      2. status 是 ok（dead / cooling 等都不行）
+      3. 档位不是明确受限的 free
+
+    和 `pool._credential_dead()` 的判据一致 —— 那边也是先看 status，
+    所以两处不会出现"列表说可用、调度说不行"的矛盾。
+    """
+    if not (account.get("access_token") or account.get("cookie")):
+        return False
+    if account.get("status") != "ok":
+        return False
+    return not tier_blocked(account)
+
+
+def usable_accounts() -> list[dict[str, Any]]:
+    """所有现在能接任务的账号。"""
+    return [a for a in list_accounts() if account_usable(a)]
+
+
+
 def get_account(aid: int) -> dict[str, Any] | None:
     with _LOCK:
         row = conn().execute("SELECT * FROM accounts WHERE id=?", (aid,)).fetchone()
@@ -572,14 +626,31 @@ def stats() -> dict[str, Any]:
     with _LOCK:
         c = conn()
         total = c.execute("SELECT COUNT(*) n FROM accounts").fetchone()["n"]
+        # 「可用账号」必须和 account_usable() 同口径（2026-10-26）。
+        #
+        # 原来只数 status='ok'，但 tier=free 的号跑不了 wan3，把它算作
+        # 可用会让客户以为"有号能用"，提交后必失败。
+        #
+        # 空 tier 算可用（理由见 account_usable 的注释：查不到不等于 free）。
         ok = c.execute(
-            "SELECT COUNT(*) n FROM accounts WHERE status='ok'"
+            "SELECT COUNT(*) n FROM accounts "
+            "WHERE status='ok' "
+            "  AND (access_token != '' OR cookie != '') "
+            "  AND LOWER(TRIM(COALESCE(tier,''))) NOT IN ('free')"
         ).fetchone()["n"]
         cooling = c.execute(
             "SELECT COUNT(*) n FROM accounts WHERE status='cooling'"
         ).fetchone()["n"]
         dead = c.execute(
             "SELECT COUNT(*) n FROM accounts WHERE status='dead'"
+        ).fetchone()["n"]
+        # free 档又没失效的号：单独给个数字，让用户知道"号是好的但没权限"。
+        # 否则它们会凭空从「可用」里消失，用户不知道去哪儿了。
+        free_tier = c.execute(
+            "SELECT COUNT(*) n FROM accounts "
+            "WHERE status='ok' "
+            "  AND (access_token != '' OR cookie != '') "
+            "  AND LOWER(TRIM(COALESCE(tier,''))) = 'free'"
         ).fetchone()["n"]
         tasks_today = c.execute(
             "SELECT COUNT(*) n FROM tasks WHERE created_at > ?",
@@ -596,6 +667,9 @@ def stats() -> dict[str, Any]:
         "accounts_ok": ok,
         "accounts_cooling": cooling,
         "accounts_dead": dead,
+        # free 档且未失效的号数：状态健康但**没有 wan3 权限**。
+        # 前端用它给一句解释，否则这些号会莫名从"可用"里消失。
+        "accounts_free": free_tier,
         "tasks_24h": tasks_today,
         "tasks_completed": done,
         "tasks_failed": failed,

@@ -319,9 +319,14 @@ async function loadStats() {
     const ok = s.accounts_ok || 0;
     const total = s.accounts_total || 0;
     const dead = s.accounts_dead || 0;
+    // free 档：状态健康但**没有 wan3 权限**（2026-10-26 加）。
+    // 它不计入"可用"，所以必须单独显示 —— 否则用户会觉得"我明明加了
+    // 3 个号，怎么只有 0 个可用"，而且完全不知道原因。
+    const freeTier = s.accounts_free || 0;
     // 「冷却中」已经不存在了（队列制不用冷却），改成「可用/总数」的直观表达
     $('#stats').innerHTML = `
-      <div class="stat ok"><div class="n">${ok}<span class="of">/${total}</span></div><div class="l">可用账号</div></div>
+      <div class="stat ${ok ? 'ok' : 'bad'}"><div class="n">${ok}<span class="of">/${total}</span></div><div class="l">可用账号</div></div>
+      <div class="stat ${freeTier ? 'warn' : ''}" title="free 档账号没有 wan3 权限，需要升级订阅"><div class="n">${freeTier}</div><div class="l">free 无权限</div></div>
       <div class="stat ${dead ? 'bad' : ''}"><div class="n">${dead}</div><div class="l">失效</div></div>
       <div class="stat"><div class="n">${s.tasks_24h || 0}</div><div class="l">24h 任务</div></div>
       <div class="stat ok"><div class="n">${s.tasks_completed || 0}</div><div class="l">成功</div></div>
@@ -350,7 +355,14 @@ async function loadAccounts() {
     };
     const [hTxt, hCls] = HEALTH[a.health] || [a.status, 'cooling'];
 
-    const tierBadge = a.tier ? `<span class="tier-badge">${esc(a.tier)}</span>` : '';
+    // tier 徽章。free 档要醒目 —— 它的号状态健康但**不能跑 wan3**
+  // （2026-10-26）。不加区分的话用户会以为这号能用，提交后莫名失败。
+  const _tier = String(a.tier || '').toLowerCase();
+  const tierBadge = a.tier
+    ? `<span class="tier-badge${_tier === 'free' ? ' tier-free' : ''}"
+        title="${_tier === 'free' ? 'free 档没有 wan3 权限，需要升级订阅' : esc(a.tier)}"
+       >${esc(a.tier)}${_tier === 'free' ? ' · 无权限' : ''}</span>`
+    : '';
     const uname = a.username ? `<b>${esc(a.username)}</b>` : '<span class="dim">未知</span>';
 
     // 令牌：直接说还剩多久；已过期就说明靠什么续

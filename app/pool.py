@@ -403,6 +403,14 @@ class Pool:
                 continue
             if a.get("status") == "dead":
                 continue
+            # free 档账号没有 wan3 权限（2026-10-26 加）。
+            #
+            # 之前不筛档位：free 号会被选中、提交、然后被上游拒绝，
+            # 白白浪费一次调度，而且错误信息是上游的（看起来像"任务失败"
+            # 而不是"这个号没权限"）。空 tier 不放行 —— 理由见
+            # store.account_usable 的注释（查不到 ≠ free）。
+            if store.tier_blocked(a):
+                continue
             if (a.get("cooldown_until") or 0) > now:
                 continue
             out.append(a)
@@ -723,11 +731,22 @@ class Pool:
                     # 续期成功就能自愈，这是"补了新 token 后自动恢复"的一半。
                     if a.get("status") == "dead":
                         continue
+                    # free 档也不探测（2026-10-26）：它没有 wan3 权限，
+                    # 探名额只会白打一次上游。注意这里**不影响续期** ——
+                    # 续期在下面独立进行，free 号如果后来升级成 pro，
+                    # token 仍是新的，下次就会正常参与。
+                    skip_probe = store.tier_blocked(a)
                     aid = a["id"]
                     lock = self._locks.get(aid)
                     if lock and lock.locked():
                         continue          # 自己在跑，没必要探
                     if (a.get("cooldown_until") or 0) > time.time():
+                        continue
+                    if skip_probe:
+                        # free 档：不探测，也不进 ready。
+                        # 如果它之前被记成 ready（升级/降级导致），撤掉 ——
+                        # 否则调度会把它当可用号派任务，然后被上游拒。
+                        self._withdraw_ready(aid, "tier_free")
                         continue
                     free = await self.probe_slot(a)
                     if free is True:
