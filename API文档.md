@@ -172,119 +172,45 @@ image_urls: [图A, 图B, 图C]   ->   图1、图2、图3
 
 ---
 
-## 3.5 上传素材（强烈建议看这节）
+## 3.5 带本地文件
 
-素材必须是**上游能抓取到的公网地址**。如果你手上是本地文件，有两条路：
-
-| 方式 | 适用 | 特点 |
-|---|---|---|
-| **提交时直接带文件**（multipart） | 一次性任务 | **一步完成**，最省事 |
-| **先上传拿链接**（`/v1/files`） | 同一素材复用多次 | 两步，但链接可缓存 |
-
-### 3.5.1 一步提交（推荐）
-
-把文件直接放进提交请求，用 `multipart/form-data`：
+图生视频要把图片随请求带上，用 `multipart/form-data`：
 
 ```bash
 curl -X POST "https://你的域名  （部署后访问 /api/docs 可拿到填好真实域名的版本）/v1/videos/generations" \
   -H "authorization: Bearer YOUR_KEY" \
   -F "prompt=让它动起来" \
   -F "image=@photo.jpg" \
-  -F "resolution=720P" \
-  -F "duration=5"
+  -F "resolution=720P"
 ```
 
-服务端会：收文件 -> 传到上游 -> 拿到公链 -> 填进 `image_urls` -> 提交任务。
-**你不需要先拿链接。**
+服务器会收文件、传到上游、拿到公链、填进 `image_urls` 再提交。**不需要你先上传拿链接。**
 
-文件字段名可以是这些（都等价）：
+字段名（写错会静默丢弃，请对照）：
 
-| 表单字段 | 归到 JSON 的哪个字段 |
+| 用这个字段 | 含义 |
 |---|---|
-| `image` / `images` / `image_urls` / `file` | `image_urls`（参考图） |
-| `video` / `videos` / `video_urls` | `video_urls`（参考视频） |
-| `audios` / `audio_urls` | `audio_urls`（参考音频） |
-| `start_frame` / `first_frame` | `start_frame`（首帧） |
-| `end_frame` / `last_frame` | `end_frame`（尾帧） |
+| `image` / `images` | 参考图 |
+| `video` / `videos` | 参考视频 |
+| `audios` | 参考音频 |
+| `start_frame` / `end_frame` | 首帧 / 尾帧 |
 
-同一个字段名传多次会自动累积成数组：
+同名多次会自动累积：`-F "image=@a.jpg" -F "image=@b.jpg"` -> 两张图。
 
-```bash
-  -F "image=@a.jpg" -F "image=@b.jpg"     # -> image_urls: [url_a, url_b]
-```
+> `audio`（不带 s）是**布尔**：输出要不要音轨。参考音频写 `audios`。
 
-> ⚠️ **`audio` 是布尔字段**（输出要不要音轨），不是参考音频。
-> 参考音频要用 `audios` 或 `audio_urls`。写错了文件会被静默丢弃。
+图片 / 视频 / 音频 / PDF 都走这一条路，不用区分。视频会被上游解码校验，非标准编码返回 422。
 
-### 3.5.2 先上传拿链接
+**不支持 base64 内联**，大文件请走 multipart。
+
+需要同一素材复用于多个任务时，可以先单独上传：
 
 ```bash
-curl -X POST "https://你的域名  （部署后访问 /api/docs 可拿到填好真实域名的版本）/v1/files" \
-  -H "authorization: Bearer YOUR_KEY" \
+curl -X POST "https://你的域名  （部署后访问 /api/docs 可拿到填好真实域名的版本）/v1/files" -H "authorization: Bearer YOUR_KEY" \
   -F "file=@photo.jpg"
 ```
 
-返回：
-
-```json
-{"url": "https://<上游CDN>/editing-temp/6147a86c-....jpg",
- "download_url": "（同上）",
- "name": "photo.jpg", "mime": "image/jpeg", "size": 234567,
- "elapsed": 0.42}
-```
-
-然后把 `url` 填进提交参数：
-
-```json
-{"prompt": "让它动起来", "image_urls": ["https://<上游CDN>/.../xxx.jpg"]}
-```
-
-### 3.5.3 支持哪些文件类型
-
-**图片、视频、音频、文档都走同一个接口、同一种方式，不需要区分。**实测四类全部可用：
-
-| 类型 | 扩展名 | 状态 |
-|---|---|---|
-| 图片 | `.png` `.jpg` `.webp` `.gif` | ✅ |
-| 视频 | `.mp4` `.mov` `.webm` | ✅ |
-| 音频 | `.mp3` `.wav` `.m4a` | ✅ |
-| 文档 | `.pdf` 等 | ✅（能传，但能否参与生成见下） |
-
-> ⚠️ **视频会被真正解码校验。** 只是文件头写着 mp4 不够 ——必须是标准 H.264 + AAC 编码、数据完整的 MP4，否则返回 422（我们会翻译成中文说明）。这是上游的行为，不是我们的限制。
-
-### 3.5.4 为什么不用 base64
-
-我们**不支持**在 JSON body 里内联 base64。原因：
-
-| | base64 内联 | multipart 文件 |
-|---|---|---|
-| 体积 | **+33%** | 原样 |
-| 8MB 文件内存峰值 | ~16MB | **0.3MB** |
-| 首字节延迟 | 收完整个文件 | 边收边转发 |
-| 失败重传 | 全量 | 可续传 |
-
-能发 JSON 的客户端都能发 multipart，而 multipart 每项都更好 ——所以没有保留 base64 的理由。
-
-### 3.5.5 素材类型的完整列表
-
-| `media[].type` | 用途 | 参与生成 |
-|---|---|---|
-| `reference_image` | 参考图 | ✅ |
-| `reference_video` | 参考视频 | ✅ |
-| `reference_audio` | 参考音频 | ✅ |
-| `first_frame` | 首帧 | ✅ |
-| `last_frame` | 尾帧（必须配首帧） | ✅ |
-| `file` | 通用文件 | ⚠️ 见下 |
-| `link` | 外链 | ⚠️ 见下 |
-
-**组合约束**（违反会 400）：
-
-- 首尾帧**不能**和任何其他素材混用（含 `file` / `link`）
-- `file` 和 `link` **只能二选一**
-- `file` / `link` 可以和 `reference_*` 组合
-- 只有 `last_frame` 没有 `first_frame` -> 拒绝
-
-> 关于 `file` / `link`：它们在协议层是合法值（来自官方 schema），但对视频生成的**实际作用**没有验证过。做图生视频/视频生视频，请用 `reference_image` / `reference_video` / `reference_audio`。
+返回 `{"url": "https://..."}`，把这个 url 填进 `image_urls` 即可。
 
 ---
 
@@ -496,54 +422,7 @@ console.log(result.url);
 
 ---
 
-## 6.5 取消任务（仅限管理页）
-
-```http
-POST /api/tasks/{id}/cancel
-```
-
-**这个接口只在管理页用，`/v1/*` 调用方不需要它。**它要求管理会话，不是 API Key。
-
-### 只有「还没提交到上游」的任务能取消
-
-| 任务当前状态 | 能否取消 | 结果 |
-|---|---|---|
-| `queued`，且从未提交到上游 | ✅ 可以 | 立即取消，队列位置释放 |
-| `queued`/`in_progress`，已提交到上游 | ❌ 返回 `409` | 上游会继续执行 |
-| `completed` / `failed` / `cancelled` | ❌ 返回 `409` | 已是终态 |
-
-**为什么已提交的不能取消**：上游没有公开的取消接口。本地「取消」只能让我们的代码不再管它，但那个任务仍在上游那边跑着、仍占着该账号的并发名额（每账号并发 = 1）。结果就是账号被一个「本地看不见的任务」锁住，队列里后面的任务干等 ——比不取消更糟。所以这里明确拒绝并说明原因。
-
-返回：
-
-```json
-{"ok": true, "id": "vtask_...", "status": "cancelled"}
-```
-
----
-
-## 6.6 版本检查
-
-```http
-GET /__version
-```
-
-不需要登录/激活即可访问（管理页首屏要显示更新提示）。返回：
-
-```json
-{"current": "2026.10.25", "latest": "2026.11.01", "has_update": true,
- "url": "https://github.com/.../releases", "repo": "...",
- "checked_at": 1792912345, "error": ""}
-```
-
-| 字段 | 说明 |
-|---|---|
-| `current` | 当前运行的版本 |
-| `latest` | 最新发布版本（查不到时为空） |
-| `has_update` | 是否有更新。**查不到时恒为 false**，不会误报 |
-| `error` | 非空表示这次没查成（网络问题），不影响任何功能 |
-
-> 这只是**提示**，不会自动更新。代码在你的部署目录里，自动替换等于远程执行代码 —— 收益远小于风险。
+> 管理页还有「取消排队任务」和「版本更新提示」两个功能，它们走 `/api/*`、要管理会话，与调用方无关，这里不展开。
 
 ---
 
